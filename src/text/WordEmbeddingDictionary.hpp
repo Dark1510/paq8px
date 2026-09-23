@@ -3,8 +3,7 @@
 //turn it on if you'd like to see word embedding statistics
 //#define SHOW_WORDEMBEDDING_STATS
 
-#include "../file/FileDisk.hpp"
-#include "../file/OpenFromMyFolder.hpp"
+#include "../file/File.hpp"
 #include "Entry.hpp"
 #include "Word.hpp"
 

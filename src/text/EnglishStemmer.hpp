@@ -1,7 +1,7 @@
 #pragma once
 
 #include "English.hpp"
-#include "Stemmer.hpp"
+#include "Word.hpp"
 #include <cctype>
 #include <cstdint>
 

@@ -1,8 +1,6 @@
 #pragma once
 
 #include "French.hpp"
-#include "Language.hpp"
-#include "Stemmer.hpp"
 #include "Word.hpp"
 #include <cctype>
 

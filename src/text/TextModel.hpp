@@ -10,18 +10,14 @@
 #include "FrenchStemmer.hpp"
 #include "German.hpp"
 #include "GermanStemmer.hpp"
-#include "Language.hpp"
-#include "Paragraph.hpp"
-#include "Segment.hpp"
-#include "Sentence.hpp"
-#include "Stemmer.hpp"
 #include "Word.hpp"
 #include "WordEmbeddingDictionary.hpp"
 #include <cassert>
 #include <cctype>
 #include <cstdint>
 
-class TextModel {
+class TextModel
+{
 private:
   static constexpr int nCM2 = 28;
   static constexpr uint8_t asciiGroup[128] = {0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 4, 5, 5, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
@@ -41,7 +37,8 @@ private:
   Cache<Paragraph, 2> paragraphs;
   Array<uint32_t> wordPos;
   uint32_t bytePos[256] {};
-  struct WordDistance {
+  struct WordDistance
+  {
       uint32_t distance[4];
       uint32_t closest;
   };
@@ -50,19 +47,21 @@ private:
   Segment *cSegment; // current segment
   Sentence *cSentence; // current sentence
   Paragraph *cParagraph; // current paragraph
-  enum Parse {
+  enum Parse
+  {
       Unknown, ReadingWord, PossibleHyphenation, WasAbbreviation, AfterComma, AfterQuote, AfterAbbreviation, ExpectDigit
   } State, pState;
-  struct {
+  struct
+  {
       uint32_t count[Language::Count - 1]; // number of recognized words of each language in the last 64 words seen
       uint64_t mask[Language::Count - 1]; // binary mask with the recognition status of the last 64 words for each language
       int id; // current detected language
       int pId; // detected language of the previous word
   } Lang;
-  struct {
+  struct
+  {
       uint64_t numbers[2]; // last 2 numbers seen
       uint64_t numHashes[2]; // hashes of the last 2 numbers seen
-      uint8_t numLength[2]; // digit length of last 2 numbers seen
       uint32_t numMask; // binary mask of the results of the arithmetic comparisons between the numbers seen
       uint32_t numDiff; // log2 of the consecutive differences between the last 16 numbers seen, clipped to 2 bits per difference
       uint32_t lastUpper; // distance to last uppercase letter
@@ -82,6 +81,7 @@ private:
       uint32_t lastNest; // distance to last nesting character
       uint32_t masks[5], wordLength[2];
       int UTF8Remaining; // remaining bytes for current UTF8-encoded Unicode code point (-1 if invalid byte found)
+      uint8_t numLength[2]; // digit length of last 2 numbers seen
       uint8_t firstLetter; // first letter of current word
       uint8_t firstChar; // first character of current line
       uint8_t expectedDigit; // next expected digit of detected numerical sequence

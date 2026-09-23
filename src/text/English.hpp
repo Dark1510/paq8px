@@ -1,15 +1,17 @@
 #pragma once
 
-#include "Language.hpp"
 #include "Word.hpp"
 
-class English : public Language {
+class English:
+public Language
+{
 private:
   static constexpr int numAbbrev = 6;
   const char *abbreviations[numAbbrev] = {"mr", "mrs", "ms", "dr", "st", "jr"};
 
 public:
-  enum Flags {
+  enum Flags
+  {
     Adjective = (1 << 2),
     Plural = (1 << 3),
     Male = (1 << 4),

@@ -1,15 +1,20 @@
 #include "FrenchStemmer.hpp"
 
-bool FrenchStemmer::isConsonant(const char c) {
+bool FrenchStemmer::isConsonant(const char c)
+{
   return !isVowel(c);
 }
 
-void FrenchStemmer::convertUtf8(Word *w) {
-  for( int i = w->start; i < w->end; i++ ) {
+void FrenchStemmer::convertUtf8(Word *w)
+{
+  for( int i = w->start; i < w->end; i++ )
+  {
     uint8_t c = w->letters[i + 1] + ((w->letters[i + 1] < 0xA0) ? 0x60 : 0x40);
-    if( w->letters[i] == 0xC3 && (isVowel(c) || (w->letters[i + 1] & 0xDF) == 0x87)) {
+    if ( w->letters[i] == 0xC3 && (isVowel(c) || (w->letters[i + 1] & 0xDF) == 0x87))
+    {
       w->letters[i] = c;
-      if( i + 1 < w->end ) {
+      if( i + 1 < w->end )
+      {
         memmove(&w->letters[i + 1], &w->letters[i + 2], w->end - i - 1);
       }
       w->end--;
@@ -17,19 +22,25 @@ void FrenchStemmer::convertUtf8(Word *w) {
   }
 }
 
-void FrenchStemmer::markVowelsAsConsonants(Word *w) {
-  for( int i = w->start; i <= w->end; i++ ) {
-    switch( w->letters[i] ) {
+void FrenchStemmer::markVowelsAsConsonants(Word *w)
+{
+  for( int i = w->start; i <= w->end; i++ )
+  {
+    switch( w->letters[i] )
+    {
       case 'i':
-      case 'u': {
+      case 'u':
+    {
         if( i > w->start && i < w->end && (isVowel(w->letters[i - 1]) || (w->letters[i - 1] == 'q' && w->letters[i] == 'u')) &&
-            isVowel(w->letters[i + 1])) {
+            isVowel(w->letters[i + 1]))
+        {
           w->letters[i] = toupper(w->letters[i]);
         }
         break;
       }
       case 'y': {
-        if((i > w->start && isVowel(w->letters[i - 1])) || (i < w->end && isVowel(w->letters[i + 1]))) {
+        if((i > w->start && isVowel(w->letters[i - 1])) || (i < w->end && isVowel(w->letters[i + 1])))
+        {
           w->letters[i] = toupper(w->letters[i]);
         }
       }
@@ -37,15 +48,19 @@ void FrenchStemmer::markVowelsAsConsonants(Word *w) {
   }
 }
 
-uint32_t FrenchStemmer::getRv(Word *w) {
+uint32_t FrenchStemmer::getRv(Word *w)
+{
   uint32_t len = w->length();
   uint32_t res = w->start + len;
   if( len >= 3 && ((isVowel(w->letters[w->start]) && isVowel(w->letters[w->start + 1])) || w->startsWith("par") || w->startsWith("col") ||
-                   w->startsWith("tap"))) {
+                   w->startsWith("tap")))
+  {
     return w->start + 3;
   }
-  for( int i = w->start + 1; i <= w->end; i++ ) {
-    if( isVowel(w->letters[i])) {
+  for( int i = w->start + 1; i <= w->end; i++ )
+  {
+    if( isVowel(w->letters[i]))
+    {
       return i + 1;
     }
   }
@@ -53,19 +68,25 @@ uint32_t FrenchStemmer::getRv(Word *w) {
   return res;
 }
 
-bool FrenchStemmer::step1(Word *w, const uint32_t rv, const uint32_t r1, const uint32_t r2, bool *forceStep2A) {
+bool FrenchStemmer::step1(Word *w, const uint32_t rv, const uint32_t r1, const uint32_t r2, bool *forceStep2A)
+{
   int i = 0;
-  for( ; i < 11; i++ ) {
-    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i])) {
+  for( ; i < 11; i++ )
+  {
+    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i]))
+    {
       w->end -= uint8_t(strlen(suffixesStep1[i]));
-      if( i == 3 /*able*/) {
+      if( i == 3 /*able*/)
+      {
         w->type |= French::Adjective;
       }
       return true;
     }
   }
-  for( ; i < 17; i++ ) {
-    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i])) {
+  for( ; i < 17; i++ )
+  {
+    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i]))
+    {
       w->end -= uint8_t(strlen(suffixesStep1[i]));
       if( w->endsWith("ic")) {
         w->changeSuffix("c", "qU");
@@ -73,40 +94,56 @@ bool FrenchStemmer::step1(Word *w, const uint32_t rv, const uint32_t r1, const u
       return true;
     }
   }
-  for( ; i < 25; i++ ) {
-    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i])) {
+  for( ; i < 25; i++ )
+  {
+    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i]))
+    {
       w->end -= uint8_t(strlen(suffixesStep1[i])) - 1 - static_cast<int>(i < 19) * 2;
-      if( i > 22 ) {
+      if( i > 22 )
+      {
         w->end += 2;
         w->letters[w->end] = 't';
       }
       return true;
     }
   }
-  for( ; i < 27; i++ ) {
+  for( ; i < 27; i++ )
+  {
     if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r1, suffixesStep1[i]) &&
         isConsonant((*w)(static_cast<uint8_t>(strlen(suffixesStep1[i]))))) {
       w->end -= uint8_t(strlen(suffixesStep1[i]));
       return true;
     }
   }
-  for( ; i < 29; i++ ) {
-    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, rv, suffixesStep1[i])) {
+  for( ; i < 29; i++ )
+  {
+    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, rv, suffixesStep1[i]))
+    {
       w->end -= uint8_t(strlen(suffixesStep1[i]));
-      if( w->endsWith("iv") && suffixInRn(w, r2, "iv")) {
+      if( w->endsWith("iv") && suffixInRn(w, r2, "iv"))
+      {
         w->end -= 2;
-        if( w->endsWith("at") && suffixInRn(w, r2, "at")) {
+        if( w->endsWith("at") && suffixInRn(w, r2, "at"))
+        {
           w->end -= 2;
         }
-      } else if( w->endsWith("eus")) {
-        if( suffixInRn(w, r2, "eus")) {
+      }
+      else if( w->endsWith("eus"))
+      {
+        if( suffixInRn(w, r2, "eus"))
+        {
           w->end -= 3;
-        } else if( suffixInRn(w, r1, "eus")) {
+        } else if( suffixInRn(w, r1, "eus"))
+        {
           w->letters[w->end] = 'x';
         }
-      } else if((w->endsWith("abl") && suffixInRn(w, r2, "abl")) || (w->endsWith("iqU") && suffixInRn(w, r2, "iqU"))) {
+      }
+      else if((w->endsWith("abl") && suffixInRn(w, r2, "abl")) || (w->endsWith("iqU") && suffixInRn(w, r2, "iqU")))
+      {
         w->end -= 3;
-      } else if((w->endsWith("i\xE8r") && suffixInRn(w, rv, "i\xE8r")) || (w->endsWith("I\xE8r") && suffixInRn(w, rv, "I\xE8r"))) {
+      }
+      else if((w->endsWith("i\xE8r") && suffixInRn(w, rv, "i\xE8r")) || (w->endsWith("I\xE8r") && suffixInRn(w, rv, "I\xE8r")))
+      {
         w->end -= 2;
         w->letters[w->end] = 'i';
       }
@@ -114,33 +151,45 @@ bool FrenchStemmer::step1(Word *w, const uint32_t rv, const uint32_t r1, const u
     }
   }
   for( ; i < 31; i++ ) {
-    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i])) {
+    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i]))
+    {
       w->end -= uint8_t(strlen(suffixesStep1[i]));
-      if( w->endsWith("abil")) {
-        if( suffixInRn(w, r2, "abil")) {
+      if( w->endsWith("abil"))
+      {
+        if( suffixInRn(w, r2, "abil"))
+        {
           w->end -= 4;
         } else {
           w->end--, w->letters[w->end] = 'l';
         }
-      } else if( w->endsWith("ic")) {
-        if( suffixInRn(w, r2, "ic")) {
+      }
+      else if( w->endsWith("ic"))
+      {
+        if( suffixInRn(w, r2, "ic"))
+        {
           w->end -= 2;
         } else {
           w->changeSuffix("c", "qU");
         }
-      } else if( w->endsWith("iv") && suffixInRn(w, r2, "iv")) {
+      } else if( w->endsWith("iv") && suffixInRn(w, r2, "iv"))
+      {
         w->end -= 2;
       }
       return true;
     }
   }
-  for( ; i < 35; i++ ) {
-    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i])) {
+  for( ; i < 35; i++ )
+  {
+    if( w->endsWith(suffixesStep1[i]) && suffixInRn(w, r2, suffixesStep1[i]))
+    {
       w->end -= uint8_t(strlen(suffixesStep1[i]));
-      if( w->endsWith("at") && suffixInRn(w, r2, "at")) {
+      if( w->endsWith("at") && suffixInRn(w, r2, "at"))
+      {
         w->end -= 2;
-        if( w->endsWith("ic")) {
-          if( suffixInRn(w, r2, "ic")) {
+        if( w->endsWith("ic"))
+        {
+          if( suffixInRn(w, r2, "ic"))
+          {
             w->end -= 2;
           } else {
             w->changeSuffix("c", "qU");
@@ -151,12 +200,15 @@ bool FrenchStemmer::step1(Word *w, const uint32_t rv, const uint32_t r1, const u
     }
   }
   for( ; i < 37; i++ ) {
-    if( w->endsWith(suffixesStep1[i])) {
-      if( suffixInRn(w, r2, suffixesStep1[i])) {
+    if( w->endsWith(suffixesStep1[i]))
+    {
+      if( suffixInRn(w, r2, suffixesStep1[i]))
+      {
         w->end -= uint8_t(strlen(suffixesStep1[i]));
         return true;
       }
-      if( suffixInRn(w, r1, suffixesStep1[i])) {
+      if( suffixInRn(w, r1, suffixesStep1[i]))
+      {
         w->changeSuffix(suffixesStep1[i], "eux");
         return true;
       }

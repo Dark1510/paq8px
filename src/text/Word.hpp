@@ -4,8 +4,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 
-class Word {
+class Word
+{
 private:
   uint64_t calculateHash();
 public:
@@ -40,4 +42,60 @@ public:
   bool endsWith(const char *suffix) const;
   bool startsWith(const char *prefix) const;
   void print() const;
+};
+
+class Segment
+{
+public:
+  Word firstWord; /**< useful following questions */
+  uint32_t wordCount {};
+  uint32_t numCount {};
+};
+
+class Sentence:
+public Segment
+{
+public:
+  enum Types  // possible sentence types, excluding Imperative
+  {Declarative, Interrogative, Exclamative, Count};
+  Types type;
+  uint32_t segmentCount {};
+  uint32_t verbIndex {}; /**< relative position of last detected verb */
+  uint32_t nounIndex {}; /**< relative position of last detected noun */
+  uint32_t capitalIndex {}; /**< relative position of last capitalized word, excluding the initial word of this sentence */
+  Word lastVerb;
+  Word lastNoun;
+  Word lastCapital;
+};
+
+class Paragraph
+{
+public:
+  uint32_t sentenceCount;
+  uint32_t typeCount[Sentence::Types::Count];
+  uint32_t typeMask;
+};
+
+class Stemmer
+{
+protected:
+  uint32_t getRegion(const Word *w, uint32_t from);
+  static bool suffixInRn(const Word *w, uint32_t rn, const char *suffix);
+  static bool charInArray(char c, const char a[], int len);
+public:
+  virtual ~Stemmer() = default;
+  virtual bool isVowel(char c) = 0;
+  virtual bool stem(Word *w) = 0;
+};
+
+class Language
+{
+public:
+  enum Flags
+  {Verb = (1 << 0), Noun = (1 << 1)};
+  enum Ids
+  {Unknown, English, French, German, Count};
+
+  virtual ~Language() = default;
+  virtual bool isAbbreviation(Word *w) = 0;
 };

@@ -1,8 +1,6 @@
 #pragma once
 
 #include "German.hpp"
-#include "Language.hpp"
-#include "Stemmer.hpp"
 #include "Word.hpp"
 #include <cctype>
 #include <cstdint>
