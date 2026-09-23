@@ -7,9 +7,8 @@
 #include "../SIMDType.hpp"
 #include "Adam.hpp"
 #ifdef X64_SIMD_AVAILABLE
-#include "Adam_AVX.hpp"
+#include "Adam.hpp"
 #endif
-#include "Adam_Scalar.hpp"
 #include "SqrtLearningRateDecay.hpp"
 #include <cstdint>
 

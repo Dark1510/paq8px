@@ -1,14 +1,8 @@
 ﻿#pragma once
 
 #include "Adam.hpp"
-#include "Adam_Scalar.hpp"
 #include "VectorFunctions.hpp"
-#include "VectorFunctions_Scalar.hpp"
 #ifdef X64_SIMD_AVAILABLE
-#include "Adam_SSE2.hpp"
-#include "Adam_AVX.hpp"
-#include "VectorFunctions_SSE2.hpp"
-#include "VectorFunctions_AVX2.hpp"
 #endif
 
 #include "SqrtLearningRateDecay.hpp"
@@ -17,7 +11,6 @@
 #include "../Array.hpp"
 #include <cstdint>
 #include <memory>
-
 
 float LstmLayer_Rand(float const range);
 
@@ -31,7 +24,8 @@ std::unique_ptr<Adam> CreateOptimizer(
   float base_lr
 );
 
-class LstmComponent{
+class LstmComponent
+{
 public:
   Array<float, 32> symbol_embeddings;
   Array<float, 32> symbol_embedding_gradients;

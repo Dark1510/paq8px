@@ -4,7 +4,8 @@
 #include <cstdint>
 #include <cstring>
 
-class LoadSave {
+class LoadSave
+{
 public:
   explicit LoadSave(FILE* f);
 

@@ -6,7 +6,8 @@
 #include <vector>
 #include <cstdint>
 
-class LstmLayer {
+class LstmLayer
+{
 private:
   std::unique_ptr<VectorFunctions> vectorFunctions;
 

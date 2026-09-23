@@ -2,7 +2,8 @@
 
 #include <cstdint>
 
-class SqrtLearningRateDecay {
+class SqrtLearningRateDecay
+{
 private:
   float initial_lr;
   float final_lr;
