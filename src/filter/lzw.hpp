@@ -7,9 +7,12 @@
 
 #include "LZWDictionary.hpp"
 
-class LZWFilter : Filter {
+class LZWFilter:
+Filter
+{
 public:
-  void encode(File *in, File *out, uint64_t  /*size*/, int  /*info*/, int & /*headerSize*/) override {
+  void encode(File *in, File *out, uint64_t  /*size*/, int  /*info*/, int & /*headerSize*/) override
+  {
     LZWDictionary dic;
     int parent = -1;
     int code = 0;
@@ -17,30 +20,40 @@ public:
     int bitsPerCode = 9;
     int bitsUsed = 0;
     bool done = false;
-    while( !done ) {
+    while( !done )
+    {
       buffer = in->getchar();
-      if( buffer < 0 ) {
+      if( buffer < 0 )
+      {
         return;// 0;
       }
-      for( int j = 0; j < 8; j++ ) {
+      for( int j = 0; j < 8; j++ )
+      {
         code += code + ((buffer >> (7 - j)) & 1), bitsUsed++;
-        if( bitsUsed >= bitsPerCode ) {
-          if( code == LZW_EOF_CODE ) {
+        if( bitsUsed >= bitsPerCode )
+        {
+          if( code == LZW_EOF_CODE )
+          {
             done = true;
             break;
           }
-          if( code == LZW_RESET_CODE ) {
+          if( code == LZW_RESET_CODE )
+          {
             dic.reset();
             parent = -1;
             bitsPerCode = 9;
           } else {
-            if( code < dic.index ) {
-              if( parent != -1 ) {
+            if( code < dic.index )
+            {
+              if( parent != -1 )
+              {
                 dic.addEntry(parent, dic.dumpEntry(out, code));
               } else {
                 out->putChar(code);
               }
-            } else if( code == dic.index ) {
+            }
+            else if( code == dic.index )
+            {
               int a = dic.dumpEntry(out, parent);
               out->putChar(a);
               dic.addEntry(parent, a);
@@ -51,7 +64,8 @@ public:
           }
           bitsUsed = 0;
           code = 0;
-          if((1u << bitsPerCode) == dic.index + 1 && dic.index < 4096 ) {
+          if((1u << bitsPerCode) == dic.index + 1 && dic.index < 4096 )
+          {
             bitsPerCode++;
           }
         }
@@ -60,13 +74,15 @@ public:
     // return 1;
   }
 
-  uint64_t decode(File * /*in*/, File * /*out*/, FMode  /*fMode*/, uint64_t  /*size*/, uint64_t & /*diffFound*/) override {
+  uint64_t decode(File * /*in*/, File * /*out*/, FMode  /*fMode*/, uint64_t  /*size*/, uint64_t & /*diffFound*/) override
+  {
     return 0;
   }
 
 };
 
-static int encodeLzw(File *in, File *out, uint64_t size, int &headerSize) {
+static int encodeLzw(File *in, File *out, uint64_t size, int &headerSize)
+{
   LZWDictionary dic;
   int parent = -1;
   int code = 0;
@@ -74,30 +90,40 @@ static int encodeLzw(File *in, File *out, uint64_t size, int &headerSize) {
   int bitsPerCode = 9;
   int bitsUsed = 0;
   bool done = false;
-  while( !done ) {
+  while( !done )
+  {
     buffer = in->getchar();
-    if( buffer < 0 ) {
+    if( buffer < 0 )
+    {
       return 0;
     }
-    for( int j = 0; j < 8; j++ ) {
+    for( int j = 0; j < 8; j++ )
+    {
       code += code + ((buffer >> (7 - j)) & 1), bitsUsed++;
-      if( bitsUsed >= bitsPerCode ) {
-        if( code == LZW_EOF_CODE ) {
+      if( bitsUsed >= bitsPerCode )
+      {
+        if( code == LZW_EOF_CODE )
+        {
           done = true;
           break;
         }
-        if( code == LZW_RESET_CODE ) {
+        if( code == LZW_RESET_CODE )
+        {
           dic.reset();
           parent = -1;
           bitsPerCode = 9;
         } else {
-          if( code < dic.index ) {
-            if( parent != -1 ) {
+          if( code < dic.index )
+          {
+            if( parent != -1 )
+            {
               dic.addEntry(parent, dic.dumpEntry(out, code));
             } else {
               out->putChar(code);
             }
-          } else if( code == dic.index ) {
+          }
+          else if( code == dic.index )
+          {
             int a = dic.dumpEntry(out, parent);
             out->putChar(a);
             dic.addEntry(parent, a);
@@ -108,7 +134,8 @@ static int encodeLzw(File *in, File *out, uint64_t size, int &headerSize) {
         }
         bitsUsed = 0;
         code = 0;
-        if((1 << bitsPerCode) == dic.index + 1 && dic.index < 4096 ) {
+        if((1 << bitsPerCode) == dic.index + 1 && dic.index < 4096 )
+        {
           bitsPerCode++;
         }
       }
@@ -117,23 +144,28 @@ static int encodeLzw(File *in, File *out, uint64_t size, int &headerSize) {
   return 1;
 }
 
-static inline void writeCode(File *f, const FMode mode, int *buffer, uint64_t *pos, int *bitsUsed, const int bitsPerCode, const int code,
-                             uint64_t *diffFound) {
+static inline void writeCode(File *f, const FMode mode, int *buffer, uint64_t *pos, int *bitsUsed, const int bitsPerCode, const int code, uint64_t *diffFound)
+{
   *buffer <<= bitsPerCode;
   *buffer |= code;
   (*bitsUsed) += bitsPerCode;
-  while((*bitsUsed) > 7 ) {
+  while((*bitsUsed) > 7 )
+  {
     const uint8_t b = *buffer >> (*bitsUsed -= 8);
     (*pos)++;
-    if( mode == FMode::FDECOMPRESS ) {
+    if( mode == FMode::FDECOMPRESS )
+    {
       f->putChar(b);
-    } else if( mode == FMode::FCOMPARE && b != f->getchar()) {
+    }
+    else if( mode == FMode::FCOMPARE && b != f->getchar())
+    {
       *diffFound = *pos;
     }
   }
 }
 
-static uint64_t decodeLzw(File *in, File *out, FMode mode, uint64_t &diffFound) {
+static uint64_t decodeLzw(File *in, File *out, FMode mode, uint64_t &diffFound)
+{
   LZWDictionary dic;
   uint64_t pos = 0;
   int parent = -1;
@@ -142,17 +174,21 @@ static uint64_t decodeLzw(File *in, File *out, FMode mode, uint64_t &diffFound) 
   int bitsPerCode = 9;
   int bitsUsed = 0;
   writeCode(out, mode, &buffer, &pos, &bitsUsed, bitsPerCode, LZW_RESET_CODE, &diffFound);
-  while((code = in->getchar()) >= 0 && diffFound == 0 ) {
+  while((code = in->getchar()) >= 0 && diffFound == 0 )
+  {
     int index = dic.findEntry(parent, code);
-    if( index < 0 ) { // entry not found
+    if( index < 0 ) // entry not found
+    {
       writeCode(out, mode, &buffer, &pos, &bitsUsed, bitsPerCode, parent, &diffFound);
-      if( dic.index > 4092 ) {
+      if( dic.index > 4092 )
+      {
         writeCode(out, mode, &buffer, &pos, &bitsUsed, bitsPerCode, LZW_RESET_CODE, &diffFound);
         dic.reset();
         bitsPerCode = 9;
       } else {
         dic.addEntry(parent, code, index);
-        if( dic.index >= (1 << bitsPerCode)) {
+        if( dic.index >= (1 << bitsPerCode))
+        {
           bitsPerCode++;
         }
       }
@@ -161,16 +197,21 @@ static uint64_t decodeLzw(File *in, File *out, FMode mode, uint64_t &diffFound) 
       parent = index;
     }
   }
-  if( parent >= 0 ) {
+  if( parent >= 0 )
+  {
     writeCode(out, mode, &buffer, &pos, &bitsUsed, bitsPerCode, parent, &diffFound);
   }
   writeCode(out, mode, &buffer, &pos, &bitsUsed, bitsPerCode, LZW_EOF_CODE, &diffFound);
-  if( bitsUsed > 0 ) { // flush buffer
+  if( bitsUsed > 0 ) // flush buffer
+  {
     const uint8_t b = uint8_t(buffer << (8 - bitsUsed));  // shift remaining bits to MSB
     pos++;
-    if( mode == FMode::FDECOMPRESS ) {
+    if( mode == FMode::FDECOMPRESS )
+    {
       out->putChar(b);
-    } else if( mode == FMode::FCOMPARE && b != out->getchar()) {
+    }
+    else if( mode == FMode::FCOMPARE && b != out->getchar())
+    {
       diffFound = pos;
     }
   }
