@@ -6,9 +6,8 @@
 #include "../Encoder.hpp"
 #include "../TransformOptions.hpp"
 #include "../file/File.hpp"
-#include "../file/FileDisk.hpp"
-#include "../file/FileTmp.hpp"
 #include "../Utils.hpp"
+#include "../Block.hpp"
 #include "Filter.hpp"
 #include "TextParserStateInfo.hpp"
 #include "base64.hpp"
@@ -24,6 +23,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+
 
 /////////////////////////// Filters /////////////////////////////////
 //@todo: Update this documentation
@@ -73,38 +73,432 @@
 
 #ifndef DISABLE_ZLIB
 
-#include "zlib.hpp"
+#include "../Utils.hpp"
+#include <zlib.h>
+
+static int parseZlibHeader(int header)
+{
+  switch(header)
+  {
+    case 0x2815:
+      return 0;
+    case 0x2853:
+      return 1;
+    case 0x2891:
+      return 2;
+    case 0x28cf:
+      return 3;
+    case 0x3811:
+      return 4;
+    case 0x384f:
+      return 5;
+    case 0x388d:
+      return 6;
+    case 0x38cb:
+      return 7;
+    case 0x480d:
+      return 8;
+    case 0x484b:
+      return 9;
+    case 0x4889:
+      return 10;
+    case 0x48c7:
+      return 11;
+    case 0x5809:
+      return 12;
+    case 0x5847:
+      return 13;
+    case 0x5885:
+      return 14;
+    case 0x58c3:
+      return 15;
+    case 0x6805:
+      return 16;
+    case 0x6843:
+      return 17;
+    case 0x6881:
+      return 18;
+    case 0x68de:
+      return 19;
+    case 0x7801:
+      return 20;
+    case 0x785e:
+      return 21;
+    case 0x789c:
+      return 22;
+    case 0x78da:
+      return 23;
+    default:
+      return -1;
+  }
+}
+
+static int zlibInflateInit(z_streamp strm, int zh)
+{
+  if( zh == -1 ) {
+    return inflateInit2(strm, -MAX_WBITS);
+  }
+  return inflateInit(strm);
+}
+
+MTFList mtf(81);
+
+static int encodeZlib(File *in, File *out, uint64_t len, int &headerSize)
+{
+  const int block = 1u << 16;
+  const int limit = 128;
+  uint8_t zin[block * 2];
+  uint8_t zOut[block];
+  uint8_t zRec[block * 2];
+  uint8_t diffByte[81 * limit];
+  uint64_t diffPos[81 * limit];
+
+  // Step 1 - parse offset type form zlib stream header
+  uint64_t posBackup = in->curPos();
+  uint32_t h1 = in->getchar();
+  uint32_t h2 = in->getchar();
+  in->setpos(posBackup);
+  int zh = parseZlibHeader(h1 * 256 + h2);
+  int memLevel = 0;
+  int cLevel = 0;
+  int cType = zh % 4;
+  int window = zh == -1 ? 0 : MAX_WBITS + 10 + zh / 4;
+  int minCLevel = window == 0 ? 1 : cType == 3 ? 7 : cType == 2 ? 6 : cType == 1 ? 2 : 1;
+  int maxCLevel = window == 0 ? 9 : cType == 3 ? 9 : cType == 2 ? 6 : cType == 1 ? 5 : 1;
+  int index = -1;
+  int nTrials = 0;
+  bool found = false;
+
+  // Step 2 - check recompressibility, determine parameters and save differences
+  z_stream mainStrm;
+  z_stream recStrm[81];
+  int diffCount[81];
+  int recPos[81];
+  int mainRet = Z_STREAM_END;
+  mainStrm.zalloc = Z_NULL;
+  mainStrm.zfree = Z_NULL;
+  mainStrm.opaque = Z_NULL;
+  mainStrm.next_in = Z_NULL;
+  mainStrm.avail_in = 0;
+  if( zlibInflateInit(&mainStrm, zh) != Z_OK )
+  {
+    return 0;
+  }
+  for( int i = 0; i < 81; i++ )
+  {
+    cLevel = (i / 9) + 1;
+    // Early skip if invalid parameter
+    if( cLevel < minCLevel || cLevel > maxCLevel )
+    {
+      diffCount[i] = limit;
+      continue;
+    }
+    memLevel = (i % 9) + 1;
+    recStrm[i].zalloc = Z_NULL;
+    recStrm[i].zfree = Z_NULL;
+    recStrm[i].opaque = Z_NULL;
+    recStrm[i].next_in = Z_NULL;
+    recStrm[i].avail_in = 0;
+    int ret = deflateInit2(&recStrm[i], cLevel, Z_DEFLATED, window - MAX_WBITS, memLevel, Z_DEFAULT_STRATEGY);
+    diffCount[i] = (ret == Z_OK) ? 0 : limit;
+    recPos[i] = block * 2;
+    diffPos[i * limit] = 0xFFFFFFFFFFFFFFFF;
+    diffByte[i * limit] = 0;
+  }
+
+  for( uint64_t i = 0; i < len; i += block )
+  {
+    uint32_t blSize = min(uint32_t(len - i), block);
+    nTrials = 0;
+    for( int j = 0; j < 81; j++ )
+    {
+      if( diffCount[j] >= limit )
+      {
+        continue;
+      }
+      nTrials++;
+      if( recPos[j] >= block )
+      {
+        recPos[j] -= block;
+      }
+    }
+    // early break if nothing left to test
+    if( nTrials == 0 ) {
+      break;
+    }
+    memmove(&zRec[0], &zRec[block], block);
+    memmove(&zin[0], &zin[block], block);
+    in->blockRead(&zin[block], blSize); // Read block from input file
+
+    // Decompress/inflate block
+    mainStrm.next_in = &zin[block];
+    mainStrm.avail_in = blSize;
+    do
+    {
+      mainStrm.next_out = &zOut[0];
+      mainStrm.avail_out = block;
+      mainRet = inflate(&mainStrm, Z_FINISH);
+      nTrials = 0;
+
+      // Recompress/deflate block with all possible parameters
+      for( int j = mtf.getFirst(); j >= 0; j = mtf.getNext())
+      {
+        if( diffCount[j] >= limit )
+        {
+          continue;
+        }
+        nTrials++;
+        recStrm[j].next_in = &zOut[0];
+        recStrm[j].avail_in = block - mainStrm.avail_out;
+        recStrm[j].next_out = &zRec[recPos[j]];
+        recStrm[j].avail_out = block * 2 - recPos[j];
+        int ret = deflate(&recStrm[j], mainStrm.total_in == len ? Z_FINISH : Z_NO_FLUSH);
+        if( ret != Z_BUF_ERROR && ret != Z_STREAM_END && ret != Z_OK )
+        {
+          diffCount[j] = limit;
+          continue;
+        }
+
+        // Compare
+        int end = 2 * block - static_cast<int>(recStrm[j].avail_out);
+        int tail = max(mainRet == Z_STREAM_END ? static_cast<int>(len) - static_cast<int>(recStrm[j].total_out) : 0, 0);
+        for( int k = recPos[j]; k < end + tail; k++ )
+        {
+          if((k < end && i + k - block < len && zRec[k] != zin[k]) || k >= end )
+          {
+            if( ++diffCount[j] < limit )
+            {
+              const int p = j * limit + diffCount[j];
+              diffPos[p] = i + k - block;
+              assert(k < int(sizeof(zin) / sizeof(*zin)));
+              diffByte[p] = zin[k];
+            }
+          }
+        }
+        // Early break on perfect match
+        if( mainRet == Z_STREAM_END && diffCount[j] == 0 )
+        {
+          index = j;
+          found = true;
+          break;
+        }
+        recPos[j] = 2U * block - recStrm[j].avail_out;
+      }
+    }
+    while( mainStrm.avail_out == 0 && mainRet == Z_BUF_ERROR && nTrials > 0 );
+    if((mainRet != Z_BUF_ERROR && mainRet != Z_STREAM_END) || nTrials == 0 )
+    {
+      break;
+    }
+  }
+  int minCount = (found) ? 0 : limit;
+  for( int i = 80; i >= 0; i-- )
+  {
+    cLevel = (i / 9) + 1;
+    if( cLevel >= minCLevel && cLevel <= maxCLevel )
+    {
+      deflateEnd(&recStrm[i]);
+    }
+    if( !found && diffCount[i] < minCount )
+    {
+      minCount = diffCount[index = i];
+    }
+  }
+  inflateEnd(&mainStrm);
+  if( minCount == limit ) {
+    return 0;
+  }
+  mtf.moveToFront(index);
+
+  // Step 3 - write parameters, differences and precompressed (inflated) data
+  out->putChar(diffCount[index]);
+  out->putChar(window);
+  out->putChar(index);
+  for( int i = 0; i <= diffCount[index]; i++ )
+  {
+    const int v = i == diffCount[index] ? int(len - diffPos[index * limit + i]) :
+                  int(diffPos[index * limit + i + 1] - diffPos[index * limit + i]) - 1;
+    out->put32(v);
+  }
+  for( int i = 0; i < diffCount[index]; i++ )
+  {
+    out->putChar(diffByte[index * limit + i + 1]);
+  }
+
+  in->setpos(posBackup);
+  mainStrm.zalloc = Z_NULL;
+  mainStrm.zfree = Z_NULL;
+  mainStrm.opaque = Z_NULL;
+  mainStrm.next_in = Z_NULL;
+  mainStrm.avail_in = 0;
+  if( zlibInflateInit(&mainStrm, zh) != Z_OK )
+  {
+    return 0;
+  }
+  for( uint64_t i = 0; i < len; i += block )
+  {
+    uint32_t blSize = min(uint32_t(len - i), block);
+    in->blockRead(&zin[0], blSize);
+    mainStrm.next_in = &zin[0];
+    mainStrm.avail_in = blSize;
+    do
+    {
+      mainStrm.next_out = &zOut[0];
+      mainStrm.avail_out = block;
+      mainRet = inflate(&mainStrm, Z_FINISH);
+      out->blockWrite(&zOut[0], block - mainStrm.avail_out);
+    }
+    while( mainStrm.avail_out == 0 && mainRet == Z_BUF_ERROR);
+    if( mainRet != Z_BUF_ERROR && mainRet != Z_STREAM_END )
+    {
+      break;
+    }
+  }
+  inflateEnd(&mainStrm);
+  headerSize = diffCount[index] * 5 + 7;
+  return static_cast<int>(mainRet == Z_STREAM_END);
+}
+
+static int decodeZlib(File *in, uint64_t size, File *out, FMode mode, uint64_t &diffFound)
+{
+  const int block = 1u << 16;
+  const int limit = 128;
+  uint8_t zin[block];
+  uint8_t zOut[block];
+  int diffCount = min(in->getchar(), limit - 1);
+  int window = in->getchar() - MAX_WBITS;
+  int index = in->getchar();
+  int memLevel = (index % 9) + 1;
+  int cLevel = (index / 9) + 1;
+  int len = 0;
+  int diffPos[limit];
+  diffPos[0] = -1;
+  for( int i = 0; i <= diffCount; i++ )
+  {
+    int v = in->get32();
+    if( i == diffCount ) {
+      len = v + diffPos[i];
+    } else {
+      diffPos[i + 1] = v + diffPos[i] + 1;
+    }
+  }
+  uint8_t diffByte[limit];
+  diffByte[0] = 0;
+  for( int i = 0; i < diffCount; i++ )
+  {
+    diffByte[i + 1] = in->getchar();
+  }
+  size -= 7 + 5 * diffCount;
+
+  z_stream recStrm;
+  int diffIndex = 1;
+  int recPos = 0;
+  recStrm.zalloc = Z_NULL;
+  recStrm.zfree = Z_NULL;
+  recStrm.opaque = Z_NULL;
+  recStrm.next_in = Z_NULL;
+  recStrm.avail_in = 0;
+  int ret = deflateInit2(&recStrm, cLevel, Z_DEFLATED, window, memLevel, Z_DEFAULT_STRATEGY);
+  if( ret != Z_OK )
+  {
+    return 0;
+  }
+  for( uint64_t i = 0; i < size; i += block )
+  {
+    uint32_t blSize = min(uint32_t(size - i), block);
+    in->blockRead(&zin[0], blSize);
+    recStrm.next_in = &zin[0];
+    recStrm.avail_in = blSize;
+    do
+    {
+      recStrm.next_out = &zOut[0];
+      recStrm.avail_out = block;
+      ret = deflate(&recStrm, i + blSize == size ? Z_FINISH : Z_NO_FLUSH);
+      if( ret != Z_BUF_ERROR && ret != Z_STREAM_END && ret != Z_OK ) {
+        break;
+      }
+      const int have = min(block - recStrm.avail_out, len - recPos);
+      while( diffIndex <= diffCount && diffPos[diffIndex] >= recPos && diffPos[diffIndex] < recPos + have )
+      {
+        zOut[diffPos[diffIndex] - recPos] = diffByte[diffIndex];
+        diffIndex++;
+      }
+      if( mode == FMode::FDECOMPRESS )
+      {
+        out->blockWrite(&zOut[0], have);
+      }
+      else if( mode == FMode::FCOMPARE )
+      {
+        for( int j = 0; j < have; j++ )
+        {
+          if( zOut[j] != out->getchar() && (diffFound == 0))
+          {
+            diffFound = recPos + j + 1;
+          }
+        }
+      }
+      recPos += have;
+
+    } while( recStrm.avail_out == 0 );
+  }
+  while( diffIndex <= diffCount )
+  {
+    if( mode == FMode::FDECOMPRESS )
+    {
+      out->putChar(diffByte[diffIndex]);
+    }
+    else if( mode == FMode::FCOMPARE )
+    {
+      if( diffByte[diffIndex] != out->getchar() && (diffFound == 0))
+      {
+        diffFound = recPos + 1;
+      }
+    }
+    diffIndex++;
+    recPos++;
+  }
+  deflateEnd(&recStrm);
+  return recPos == len ? len : 0;
+}
+
 
 #endif //DISABLE_ZLIB
 
-static bool isGrayscalePalette(File *in, int n = 256, int isRGBA = 0) {
+static bool isGrayscalePalette(File *in, int n = 256, int isRGBA = 0)
+{
   uint64_t offset = in->curPos();
   int stride = 3 + isRGBA;
   int res = (n > 0) << 8;
   int order = 1;
-  for( int i = 0; (i < n * stride) && ((res >> 8) != 0); i++ ) {
+  for( int i = 0; (i < n * stride) && ((res >> 8) != 0); i++ )
+  {
     int b = in->getchar();
-    if( b == EOF) {
+    if( b == EOF)
+    {
       res = 0;
       break;
     }
-    if (i == 0) {
+    if (i == 0)
+    {
       res = 0x100 | b;
       order = 1 - 2 * static_cast<int>(b > int(ilog2(n) / 4));
       continue;
     }
     //"j" is the index of the current byte in this color entry
     int j = i % stride;
-    if (j == 0) {
+    if (j == 0)
+    {
       // load first component of this entry
       int k = (b - (res & 0xFF)) * order;
       res = res & (static_cast<int>(k >= 0 && k <= 8) << 8);
       res |= (res) != 0 ? b : 0;
     }
-    else if (j == 3) {
+    else if (j == 3)
+    {
     res &= (static_cast<int>((b == 0) || (b == 0xFF)) * 0x1FF); // alpha/attribute component must be zero or 0xFF
     }
-    else {
+    else
+    {
     res &= (static_cast<int>(b == (res & 0xFF)) * 0x1FF);
     }
   }
@@ -118,38 +512,54 @@ static bool isGrayscalePalette(File *in, int n = 256, int isRGBA = 0) {
 // nEntries is the number of entries per channel (e.g. 256 for an 8-bit image).
 // fileOffset is the absolute file offset to the start of the ColorMap data.
 // Returns true if R==G==B for all entries (i.e. the palette is grayscale).
-static bool isTiffGrayscaleColorMap(File* in, uint64_t fileOffset, int nEntries) {
+static bool isTiffGrayscaleColorMap(File* in, uint64_t fileOffset, int nEntries)
+{
   in->setpos(fileOffset);
   Array<uint8_t> rHi(nEntries);
-  for (int e = 0; e < nEntries; ++e) {
-    int lo = in->getchar(); int hi = in->getchar();
-    if (lo == EOF || hi == EOF) return false;
+  for (int e = 0; e < nEntries; ++e)
+  {
+    int lo = in->getchar();
+    int hi = in->getchar();
+    if (lo == EOF || hi == EOF)
+        return false;
     rHi[e] = static_cast<uint8_t>(hi);
   }
-  for (int e = 0; e < nEntries; ++e) {
-    int lo = in->getchar(); int hi = in->getchar();
-    if (lo == EOF || hi == EOF) return false;
-    if (static_cast<uint8_t>(hi) != rHi[e]) return false;
+  for (int e = 0; e < nEntries; ++e)
+  {
+    int lo = in->getchar();
+    int hi = in->getchar();
+    if (lo == EOF || hi == EOF)
+        return false;
+    if (static_cast<uint8_t>(hi) != rHi[e])
+        return false;
   }
-  for (int e = 0; e < nEntries; ++e) {
-    int lo = in->getchar(); int hi = in->getchar();
-    if (lo == EOF || hi == EOF) return false;
-    if (static_cast<uint8_t>(hi) != rHi[e]) return false;
+  for (int e = 0; e < nEntries; ++e)
+  {
+    int lo = in->getchar();
+    int hi = in->getchar();
+    if (lo == EOF || hi == EOF)
+        return false;
+    if (static_cast<uint8_t>(hi) != rHi[e])
+        return false;
   }
   return true;
 }
 
 //for MRB detection:
 //read compressed word,dword
-uint16_t GetCWord(File* f) {
+uint16_t GetCWord(File* f)
+{
   uint8_t b = f->getchar();
-  if (b & 1) return ((f->getchar() << 8) | b) >> 1;
+  if (b & 1)
+      return ((f->getchar() << 8) | b) >> 1;
   return b >> 1;
 }
-uint32_t GetCDWord(File* f) {
+uint32_t GetCDWord(File* f)
+{
   uint16_t w = f->getchar();
   w = w | (f->getchar() << 8);
-  if (w & 1) {
+  if (w & 1)
+  {
     uint16_t w1 = f->getchar();
     w1 = w1 | (f->getchar() << 8);
     return ((w1 << 16) | w) >> 1;
@@ -158,11 +568,13 @@ uint32_t GetCDWord(File* f) {
 }
 
 ALWAYS_INLINE
-static bool is_base85(unsigned char c) {
+static bool is_base85(unsigned char c)
+{
   return (isalnum(c) || (c == 13) || (c == 10) || (c == 'y') || (c == 'z') || (c >= '!' && c <= 'u'));
 }
 
-struct DetectionInfo {
+struct DetectionInfo
+{
   uint64_t HeaderStart{};
   uint64_t HeaderLength{};
   uint64_t DataStart{};
@@ -170,7 +582,8 @@ struct DetectionInfo {
   BlockType Type{};
   int DataInfo{};
 
-  void IMG_DET(uint64_t blockStart, BlockType type, uint64_t start_pos, uint32_t header_len, uint32_t width, uint32_t height) {
+  void IMG_DET(uint64_t blockStart, BlockType type, uint64_t start_pos, uint32_t header_len, uint32_t width, uint32_t height)
+  {
     Type = type;
     HeaderStart = blockStart + start_pos;
     HeaderLength = header_len;
@@ -179,7 +592,8 @@ struct DetectionInfo {
     DataInfo = width;
   }
 
-  void AUD_DET(uint64_t blockStart, BlockType type, uint64_t start_pos, uint32_t header_len, uint64_t data_len, int wmode) {
+  void AUD_DET(uint64_t blockStart, BlockType type, uint64_t start_pos, uint32_t header_len, uint64_t data_len, int wmode)
+  {
     Type = type;
     HeaderStart = blockStart + start_pos;
     HeaderLength = header_len;
@@ -188,7 +602,8 @@ struct DetectionInfo {
     DataInfo = wmode;
   }
 
-  void MRB_DET(uint64_t blockStart, BlockType type, uint8_t packingMethod, uint16_t colorBits, uint64_t start_pos, uint32_t header_len, uint64_t data_len, int width, int height) {
+  void MRB_DET(uint64_t blockStart, BlockType type, uint8_t packingMethod, uint16_t colorBits, uint64_t start_pos, uint32_t header_len, uint64_t data_len, int width, int height)
+  {
     Type = type;
     HeaderStart = blockStart + start_pos;
     HeaderLength = header_len;
@@ -197,7 +612,8 @@ struct DetectionInfo {
     DataInfo = (colorBits << 2 | packingMethod) << 24 | width << 12 | height;
   }
 
-  void DBF_DET(uint64_t blockStart, BlockType type, uint64_t start_pos, uint32_t header_len, uint64_t data_len, int recordLength) {
+  void DBF_DET(uint64_t blockStart, BlockType type, uint64_t start_pos, uint32_t header_len, uint64_t data_len, int recordLength)
+  {
     Type = type;
     HeaderStart = blockStart + start_pos;
     HeaderLength = header_len;
@@ -206,7 +622,8 @@ struct DetectionInfo {
     DataInfo = recordLength;
   }
 
-  bool SizeVerificationPassed(uint64_t nextBlockStart) {
+  bool SizeVerificationPassed(uint64_t nextBlockStart)
+  {
     bool passed = DataStart + DataLength <= nextBlockStart;
     if (!passed)
       memset(this, 0, sizeof(DetectionInfo));
@@ -214,14 +631,16 @@ struct DetectionInfo {
   }
 };
 
-struct TextDetectionInfo {
+struct TextDetectionInfo
+{
   uint64_t DataStart{};
   uint64_t DataLength{};
   BlockType Type{}; // DEFAULT / TEXT / TEXT_EOL
 };
 
 // Detect text blocks (TEXT/TEXT_EOL) inside a DEFAULT block
-static TextDetectionInfo detectText(File* in, uint64_t blockStart, uint64_t blockSize) {
+static TextDetectionInfo detectText(File* in, uint64_t blockStart, uint64_t blockSize)
+{
   TextDetectionInfo detectionInfo;
 
   TextParserStateInfo textParser;
@@ -231,9 +650,11 @@ static TextDetectionInfo detectText(File* in, uint64_t blockStart, uint64_t bloc
   const uint64_t n = blockSize;
   uint32_t buf0 = 0;
 
-  for (uint64_t i = 0; i < n; ++i) {
+  for (uint64_t i = 0; i < n; ++i)
+  {
     int c = in->getchar();
-    if (c == EOF) {
+    if (c == EOF)
+    {
       quit("detectText(): Unexpected end of file");
     }
     uint8_t pc = buf0 & 0xff;
@@ -243,38 +664,48 @@ static TextDetectionInfo detectText(File* in, uint64_t blockStart, uint64_t bloc
     textParser.UTF8State =
       t == TextParserStateInfo::utf8Reject ? TextParserStateInfo::utf8Reject : //don't accept the non-pritable ascii chars
       TextParserStateInfo::utf8StateTable[256 + textParser.UTF8State + t];
-    
+
     //some exceptions we still accept
-    if (textParser.UTF8State == TextParserStateInfo::utf8Reject) { // illegal state
-      if (c == 0 && pc >= 32 && pc <= 127 /* asciiz */) {
+    if (textParser.UTF8State == TextParserStateInfo::utf8Reject) // illegal state
+    {
+      if (c == 0 && pc >= 32 && pc <= 127 /* asciiz */)
+      {
         textParser.UTF8State = TextParserStateInfo::utf8Accept;
       }
     }
-    
-    if (c == NEW_LINE) {
-      if (pc != CARRIAGE_RETURN) {
+
+    if (c == NEW_LINE)
+    {
+      if (pc != CARRIAGE_RETURN)
+      {
         textParser.EOLType = 2; // mixed or LF-only
       }
-      else if (textParser.EOLType == 0) {
+      else if (textParser.EOLType == 0)
+      {
         textParser.EOLType = 1; // CRLF-only
       }
     }
 
-    if (textParser.UTF8State == TextParserStateInfo::utf8Accept) {
+    if (textParser.UTF8State == TextParserStateInfo::utf8Accept)
+    {
       textParser.invalidCount = textParser.invalidCount * (TextParserStateInfo::TEXT_ADAPT_RATE - 1) / TextParserStateInfo::TEXT_ADAPT_RATE;
-      if (textParser.invalidCount == 0) {
+      if (textParser.invalidCount == 0)
+      {
         textParser.End = i;
       }
     }
 
-    if (textParser.UTF8State == TextParserStateInfo::utf8Reject) { // illegal state
+    if (textParser.UTF8State == TextParserStateInfo::utf8Reject) // illegal state
+    {
       textParser.invalidCount = textParser.invalidCount * (TextParserStateInfo::TEXT_ADAPT_RATE - 1) / TextParserStateInfo::TEXT_ADAPT_RATE + TextParserStateInfo::TEXT_ADAPT_RATE;
       textParser.UTF8State = TextParserStateInfo::utf8Accept; // reset state
-      if (textParser.invalidCount >= TextParserStateInfo::TEXT_MAX_MISSES * TextParserStateInfo::TEXT_ADAPT_RATE) {
+      if (textParser.invalidCount >= TextParserStateInfo::TEXT_MAX_MISSES * TextParserStateInfo::TEXT_ADAPT_RATE)
+      {
 
         //end of text block
         //if we have a large enough valid textblock, get it
-        if (textParser.Start == 0 && textParser.isLargeText()) {
+        if (textParser.Start == 0 && textParser.isLargeText())
+        {
           detectionInfo.Type = textParser.EOLType == 1 ? BlockType::TEXT_EOL : BlockType::TEXT;
           detectionInfo.DataStart = blockStart;
           detectionInfo.DataLength = textParser.End + 1;
@@ -287,7 +718,8 @@ static TextDetectionInfo detectText(File* in, uint64_t blockStart, uint64_t bloc
 
     //early stop
     //we have a large enough text block, but it's not the first block
-    if (textParser.Start != 0 && textParser.isLargeText()) {
+    if (textParser.Start != 0 && textParser.isLargeText())
+    {
       detectionInfo.Type = BlockType::DEFAULT;
       detectionInfo.DataStart = blockStart;
       detectionInfo.DataLength = textParser.Start;
@@ -307,7 +739,8 @@ static TextDetectionInfo detectText(File* in, uint64_t blockStart, uint64_t bloc
   }
 
   //DEFAULT (->TEXT)
-  if (textParser.Start != 0 && textParser.isLargeText()) {
+  if (textParser.Start != 0 && textParser.isLargeText())
+  {
     detectionInfo.Type = BlockType::DEFAULT;
     detectionInfo.DataStart = blockStart;
     detectionInfo.DataLength = textParser.Start; //could overshoot depending on how the inalidcount decays
@@ -322,15 +755,17 @@ static TextDetectionInfo detectText(File* in, uint64_t blockStart, uint64_t bloc
   return detectionInfo;
 }
 
-struct dBASE {
-  uint8_t Version{};
+struct dBASE
+{
   uint32_t nRecords{};
   uint16_t RecordLength{};
   uint16_t HeaderLength{};
+  uint8_t Version{};
 };
 
 // Detect blocks
-static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions* const transformOptions) {
+static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions* const transformOptions)
+{
 
   DetectionInfo detectionInfo;
 
@@ -345,18 +780,18 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   uint32_t buf2 = 0;
   uint32_t buf1 = 0;
   uint32_t buf0 = 0;
-  
+
   uint64_t start = 0;
 
   start = in->curPos(); // start of the current block
-  
+
   // For EXE detection
   Array<uint64_t> absPos(256); // CALL/JMP abs. address. low byte -> last offset
   Array<uint64_t> relPos(256); // CALL/JMP relative address. low byte -> last offset
   int e8e9count = 0; // number of consecutive CALL/JMPs
   uint64_t e8e9pos = 0; // offset of first CALL or JMP instruction
   uint64_t e8e9last = 0; // offset of most recent CALL or JMP
-  
+
   // For DEC Alpha detection
   int decAlpha = 0;
   uint64_t decAlphaHeaderStart = 0;
@@ -366,7 +801,7 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   uint64_t decAlphaSectionLen = 0;
 
   // For JPEG detection
-  uint64_t soi = 0; // Start Of Image 
+  uint64_t soi = 0; // Start Of Image
   uint64_t sof = 0; // Start Of Frame
   uint64_t sos = 0; // Start Of Scan
   uint64_t app = 0; // Application-specific marker
@@ -381,19 +816,19 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   int wavType = 0; // 1 for WAV, 2 for SF2
   int wavLen = 0;
   uint64_t wavlist = 0; //position of a LIST info chunk (if present)
-  
+
   // For AIFF detection
   uint64_t aiff = 0;
   int aiffm = 0;
-  int aiffs = 0; 
-  
+  int aiffs = 0;
+
   // For S3M detection
   uint64_t s3mi = 0;
   int s3Mno = 0;
-  int s3Mni = 0; 
-   
+  int s3Mni = 0;
+
   // For MRB detection
-  uint64_t mrb = 0; 
+  uint64_t mrb = 0;
   uint8_t mrbPictureType = 0;
   uint8_t mrbPackingMethod = 0;
   uint16_t mrbmulti = 0; // number of pictures in multi-resolution-bitmap minus 1
@@ -407,12 +842,12 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   int bmpof = 0;
   int bmps = 0;
   int nColors = 0;
-  
+
   // For RGB detection
   uint64_t rgbi = 0;
   int rgbx = 0;
-  int rgby = 0; 
-  
+  int rgby = 0;
+
   // For TGA detection
   uint64_t tga = 0;
   int tgax = 0;
@@ -420,8 +855,8 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   int tgaz = 0;
   int tgat = 0;
   int tgaid = 0;
-  int tgamap = 0; 
-  
+  int tgamap = 0;
+
   // For PBM (Portable BitMap), PGM (Portable GrayMap), PPM (Portable PixMap), PAM (Portable Arbitrary Map) detection
   uint64_t pgm = 0;
   int pgmComment = 0; // flag for presence of a comment line
@@ -435,11 +870,11 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   uint64_t pgmDataSize = 0; // image data size in bytes
   int pgmPtr = 0; // index in pgmBuf
   char pgmBuf[32];
-  
+
   // For CD sectors detection
   uint64_t cdi = 0;
   int cda = 0;
-  int cdm = 0; 
+  int cdm = 0;
   uint32_t cdf = 0;
 
   // For ZLIB stream detection
@@ -483,7 +918,7 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   int gifb = 0;
   int gifplt = 0;
   static bool gifGray = false;
-  
+
   // For PNG detection
   uint64_t png = 0;
   int pngw = 0;
@@ -507,7 +942,8 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   } tiffStrips = {};
 
   // Continue emitting pending TIFF LZW strips from a previous detect() call
-  if (tiffStrips.next > 0 && tiffStrips.next < tiffStrips.count) {
+  if (tiffStrips.next > 0 && tiffStrips.next < tiffStrips.count)
+  {
     const int s = tiffStrips.next++;
     detectionInfo.Type = BlockType::LZW;
     detectionInfo.DataInfo = tiffStrips.info;
@@ -518,9 +954,11 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     return detectionInfo;
   }
 
-  for (uint64_t i = 0; i < n; ++i) {
+  for (uint64_t i = 0; i < n; ++i)
+  {
     int c = in->getchar();
-    if (c == EOF) {
+    if (c == EOF)
+    {
       quit("detect(): Unexpected end of file");
     }
 
@@ -536,12 +974,15 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     textParserState = TextParserStateInfo::utf8StateTable[256 + textParserState + t];
 
     // detect PNG images
-    if ((png == 0) && buf3 == 0x89504E47 /*%PNG*/ && buf2 == 0x0D0A1A0A && buf1 == 0x0000000D && buf0 == 0x49484452) {
+    if ((png == 0) && buf3 == 0x89504E47 /*%PNG*/ && buf2 == 0x0D0A1A0A && buf1 == 0x0000000D && buf0 == 0x49484452)
+    {
       png = i, pngType = -1, lastChunk = buf3;
     }
-    if (png != 0) {
+    if (png != 0)
+    {
       const uint64_t p = i - png;
-      if (p == 12) {
+      if (p == 12)
+      {
         pngw = buf2;
         pngh = buf1;
         pngbps = buf0 >> 24;
@@ -550,18 +991,22 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         png *= static_cast<int>((buf0 & 0xFFFF) == 0 && (pngw != 0) && (pngh != 0) && pngbps == 8 &&
           ((pngType == 0) || pngType == 2 || pngType == 3 || pngType == 4 || pngType == 6));
       }
-      else if (p > 12 && pngType < 0) {
+      else if (p > 12 && pngType < 0)
+      {
         png = 0;
       }
-      else if (p == 17) {
+      else if (p == 17)
+      {
         png *= static_cast<int>((buf1 & 0xFF) == 0);
         nextChunk = (png) != 0 ? i + 8 : 0;
       }
-      else if (p > 17 && i == nextChunk) {
+      else if (p > 17 && i == nextChunk)
+      {
         nextChunk += buf1 + 4 /*CRC*/ + 8 /*Chunk length+id*/;
         lastChunk = buf0;
         png *= static_cast<int>(lastChunk != 0x49454E44 /*IEND*/);
-        if (lastChunk == 0x504C5445 /*PLTE*/) {
+        if (lastChunk == 0x504C5445 /*PLTE*/)
+        {
           png *= static_cast<int>(buf1 % 3 == 0);
           pnggray = static_cast<int>((png != 0) && isGrayscalePalette(in, buf1 / 3));
         }
@@ -580,24 +1025,30 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
 
     int zh = parseZlibHeader(((int)zBuf[(zBufPos - 32) & 0xFF]) * 256 + (int)zBuf[(zBufPos - 32 + 1) & 0xFF]);
     bool valid = (i >= 31 && zh != -1);
-    if (!valid && transformOptions->useBruteForceDeflateDetection && i >= 255) {
+    if (!valid && transformOptions->useBruteForceDeflateDetection && i >= 255)
+    {
       uint8_t bType = (zBuf[zBufPos] & 7) >> 1;
-      if ((valid = (bType == 1 || bType == 2))) {
+      if ((valid = (bType == 1 || bType == 2)))
+      {
         int maximum = 0, used = 0, offset = zBufPos;
-        for (int i = 0; i < 4; i++, offset += 64) {
-          for (int j = 0; j < 64; j++) {
+        for (int i = 0; i < 4; i++, offset += 64)
+        {
+          for (int j = 0; j < 64; j++)
+          {
             int freq = histogram[zBuf[(offset + j) & 0xFF]];
             used += (freq > 0);
             maximum += (freq > maximum);
           }
-          if (maximum >= ((12 + i) << i) || used * (6 - i) < (i + 1) * 64) {
+          if (maximum >= ((12 + i) << i) || used * (6 - i) < (i + 1) * 64)
+          {
             valid = false;
             break;
           }
         }
       }
     }
-    if (valid || zZipPos == i) {
+    if (valid || zZipPos == i)
+    {
       int streamLength = 0, ret = 0, brute = (zh == -1 && zZipPos != i);
 
       // Quick check possible stream by decompressing first 32 bytes
@@ -607,7 +1058,8 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
       strm.opaque = Z_NULL;
       strm.next_in = Z_NULL;
       strm.avail_in = 0;
-      if (zlibInflateInit(&strm, zh) == Z_OK) {
+      if (zlibInflateInit(&strm, zh) == Z_OK)
+      {
         strm.next_in = &zBuf[(zBufPos - (brute ? 0 : 32)) & 0xFF];
         strm.avail_in = 32;
         strm.next_out = zout;
@@ -615,7 +1067,8 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         ret = inflate(&strm, Z_FINISH);
         ret = (inflateEnd(&strm) == Z_OK && (ret == Z_STREAM_END || ret == Z_BUF_ERROR) && strm.total_in >= 16);
       }
-      if (ret) {
+      if (ret)
+      {
         // Verify valid stream and determine stream length
         const uint64_t savedpos = in->curPos();
         strm.zalloc = Z_NULL;
@@ -624,16 +1077,19 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         strm.next_in = Z_NULL;
         strm.avail_in = 0;
         strm.total_in = strm.total_out = 0;
-        if (zlibInflateInit(&strm, zh) == Z_OK) {
+        if (zlibInflateInit(&strm, zh) == Z_OK)
+        {
           uint64_t blstart = static_cast<uint64_t>(std::max<int64_t>(i - (brute ? 255 : 31), 0));
-          for (uint64_t j = blstart; j < n; j += 1 << 16) {
+          for (uint64_t j = blstart; j < n; j += 1 << 16)
+          {
             uint32_t blsize = static_cast<uint32_t>(min(n - j, UINT64_C(1) << 16));
             in->setpos(start + j);
             if (in->blockRead(zin, blsize) != blsize)
               break;
             strm.next_in = zin;
             strm.avail_in = blsize;
-            do {
+            do
+            {
               strm.next_out = zout;
               strm.avail_out = 1 << 16;
               ret = inflate(&strm, Z_FINISH);
@@ -648,9 +1104,11 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         }
         in->setpos(savedpos);
       }
-      if (streamLength > (brute << 7)) {
+      if (streamLength > (brute << 7))
+      {
         int info = 0;
-        if (pdfImW > 0 && pdfImW < 0x1000000 && pdfImH > 0) {
+        if (pdfImW > 0 && pdfImW < 0x1000000 && pdfImH > 0)
+        {
           if (pdfImB == 8 && (int)strm.total_out == pdfImW * pdfImH)
             info = ((pdfGray ? BlockType::IMAGE8GRAY : BlockType::IMAGE8) << 24) | pdfImW;
           if (pdfImB == 8 && (int)strm.total_out == pdfImW * pdfImH * 3)
@@ -661,7 +1119,8 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
             info = (BlockType::IMAGE1 << 24) | ((pdfImW + 7) / 8);
           pdfGray = 0;
         }
-        else if (png && pngw < 0x1000000 && lastChunk == 0x49444154 /*IDAT*/) {
+        else if (png && pngw < 0x1000000 && lastChunk == 0x49444154 /*IDAT*/)
+        {
           if (pngbps == 8 && pngType == 2 /*color, no alpha*/ && (int)strm.total_out == (pngw * 3 + 1) * pngh)
             info = (BlockType::PNG24 << 24) | (pngw * 3), png = 0;
           else if (pngbps == 8 && pngType == 6 /*color, with alpha*/ && (int)strm.total_out == (pngw * 4 + 1) * pngh)
@@ -678,7 +1137,8 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     }
     if (zh == -1 && zBuf[(zBufPos - 32) & 0xFF] == 'P' && zBuf[(zBufPos - 32 + 1) & 0xFF] == 'K' &&
       zBuf[(zBufPos - 32 + 2) & 0xFF] == '\x3' && zBuf[(zBufPos - 32 + 3) & 0xFF] == '\x4' && zBuf[(zBufPos - 32 + 8) & 0xFF] == '\x8' &&
-      zBuf[(zBufPos - 32 + 9) & 0xFF] == '\0') {
+      zBuf[(zBufPos - 32 + 9) & 0xFF] == '\0')
+    {
       int nlen = (int)zBuf[(zBufPos - 32 + 26) & 0xFF] + ((int)zBuf[(zBufPos - 32 + 27) & 0xFF]) * 256 +
         (int)zBuf[(zBufPos - 32 + 28) & 0xFF] + ((int)zBuf[(zBufPos - 32 + 29) & 0xFF]) * 256;
       if (nlen < 256 && i + 30 + nlen < n)
@@ -709,46 +1169,74 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
       dbasei = i + 1;
       dbase.Version = ((c >> 4) == 3) ? 3 : c & 7;
     }
-    if (dbasei) {
+    if (dbasei)
+    {
       const int p = int(i - dbasei + 1);
       //1-2-3: Date of last update; in YYMMDD format
-      if (p == 1) { if (c < 83) dbasei = 0; } //year (the DBF file type was introduced with dBASE II in 1983.)
-      else if (p == 2) { if (!(c > 0 && c < 13)) dbasei = 0; } //month
-      else if (p == 3) { if (!(c > 0 && c < 32)) dbasei = 0; }//day
+      if (p == 1)
+      { if (c < 83) dbasei = 0; } //year (the DBF file type was introduced with dBASE II in 1983.)
+      else if (p == 2)
+      { if (!(c > 0 && c < 13)) dbasei = 0; } //month
+      else if (p == 3)
+      { if (!(c > 0 && c < 32)) dbasei = 0; }//day
       //4-7: Number of records in the table. (Least significant byte first.)
-      else if (p == 7) { if (!((dbase.nRecords = bswap(buf0)) > 0 && dbase.nRecords < 0x40000000)) dbasei = 0; }
+      else if (p == 7)
+      { if (!((dbase.nRecords = bswap(buf0)) > 0 && dbase.nRecords < 0x40000000)) dbasei = 0; }
       //8-9: Number of bytes in the header. (Least significant byte first.)
-      else if (p == 9) { if (!((dbase.HeaderLength = ((buf0 >> 8) & 0xff) | (c << 8)) > 32 && (((dbase.HeaderLength - 32 - 1) % 32) == 0 || (dbase.HeaderLength > 255 + 8 && (((dbase.HeaderLength -= 255 + 8) - 32 - 1) % 32) == 0)))) dbasei = 0; }
+      else if (p == 9)
+      {
+          if (!((dbase.HeaderLength = ((buf0 >> 8) & 0xff) | (c << 8)) > 32 && (((dbase.HeaderLength - 32 - 1) % 32) == 0 || (dbase.HeaderLength > 255 + 8 && (((dbase.HeaderLength -= 255 + 8) - 32 - 1) % 32) == 0))))
+              dbasei = 0;
+      }
       //10-11: Number of bytes in the record. (Least significant byte first.)
-      else if (p == 11) { if (!(((dbase.RecordLength = ((buf0 >> 8) & 0xff) | (c << 8))) > 8 && dbase.HeaderLength + dbase.nRecords * dbase.RecordLength < blockSize)) dbasei = 0; }
+      else if (p == 11)
+      {
+          if (!(((dbase.RecordLength = ((buf0 >> 8) & 0xff) | (c << 8))) > 8 && dbase.HeaderLength + dbase.nRecords * dbase.RecordLength < blockSize))
+              dbasei = 0;
+      }
       //12-13: Reserved; filled with zeros.
       //14: Flag indicating incomplete dBASE IV transaction. 0 or 1.
       //15: dBASE IV encryption flag. 0 or 1.
-      else if (p == 15) { if ((buf0 & 0xfffffefe) != 0) dbasei = 0; }
+      else if (p == 15)
+      {
+          if ((buf0 & 0xfffffefe) != 0)
+              dbasei = 0;
+      }
       //16-27: Reserved for multi - user processing.
       //28: Production .mdx file flag; 1 if there is a production .mdx file, 0 if not
-      else if (p == 28) { if ((c & 0xfe) != 0) dbasei = 0; }
+      else if (p == 28)
+      {
+          if ((c & 0xfe) != 0)
+          dbasei = 0;
+      }
       //30-31: Reserved; filled with zeros.
-      else if (p == 31) { if ((buf0 & 0xffff) != 0) dbasei = 0; }
+      else if (p == 31)
+      {
+          if ((buf0 & 0xffff) != 0)
+              dbasei = 0;
+      }
       //32: for dBase III, IV and 5 the 'Field descriptor array' starts now and is n*32 bytes, for level 7 it starts at 68 and is n*48 bytes
-      else if (p == 32) {
+      else if (p == 32)
+      {
         uint64_t savedpos = in->curPos();
         in->setpos(savedpos - 34 + dbase.HeaderLength);
         uint8_t marker = in->getchar(); // field descriptor array terminator, it must be 0x0d
-        if (marker != 0x0d) { 
-          dbasei = 0; 
-          in->setpos(savedpos); 
+        if (marker != 0x0d)
+        {
+          dbasei = 0;
+          in->setpos(savedpos);
         }
-        else {
+        else
+        {
           uint32_t endPos = dbase.nRecords * dbase.RecordLength;
           uint64_t seekpos = endPos + in->curPos();
           in->setpos(seekpos);
           marker = in->getchar(); // file end marker, it must be 0x1a
-          if (marker != 0x1a) {
+          if (marker != 0x1a)
+          {
             dbasei = 0;
             in->setpos(savedpos);
-          }
-          else {
+          } else {
             //success
             in->setpos(savedpos);
             detectionInfo.DBF_DET(start, BlockType::DBF, dbasei - 1, dbase.HeaderLength, dbase.nRecords* dbase.RecordLength + 1, dbase.RecordLength);
@@ -758,48 +1246,62 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
       }
     }
 
-    if (i - pdfimp > 1024) {
+    if (i - pdfimp > 1024)
+    {
       pdfIm = pdfImW = pdfImH = pdfImB = pdfGray = 0; // fail
     }
-    if (pdfIm > 1 && !((isspace(c) != 0) || (isdigit(c) != 0))) {
+    if (pdfIm > 1 && !((isspace(c) != 0) || (isdigit(c) != 0)))
+    {
       pdfIm = 1;
     }
-    if (pdfIm == 2 && (isdigit(c) != 0)) {
+    if (pdfIm == 2 && (isdigit(c) != 0))
+    {
       pdfImW = pdfImW * 10 + (c - '0');
     }
-    if (pdfIm == 3 && (isdigit(c) != 0)) {
+    if (pdfIm == 3 && (isdigit(c) != 0))
+    {
       pdfImH = pdfImH * 10 + (c - '0');
     }
-    if (pdfIm == 4 && (isdigit(c) != 0)) {
+    if (pdfIm == 4 && (isdigit(c) != 0))
+    {
       pdfImB = pdfImB * 10 + (c - '0');
     }
-    if ((buf0 & 0xffff) == 0x3c3c) {
+    if ((buf0 & 0xffff) == 0x3c3c)
+    {
       pdfimp = i, pdfIm = 1; // <<
     }
-    if ((pdfIm != 0) && (buf1 & 0xffff) == 0x2f57 && buf0 == 0x69647468) {
+    if ((pdfIm != 0) && (buf1 & 0xffff) == 0x2f57 && buf0 == 0x69647468)
+    {
       pdfIm = 2, pdfImW = 0; // /Width
     }
-    if ((pdfIm != 0) && (buf1 & 0xffffff) == 0x2f4865 && buf0 == 0x69676874) {
+    if ((pdfIm != 0) && (buf1 & 0xffffff) == 0x2f4865 && buf0 == 0x69676874)
+    {
       pdfIm = 3, pdfImH = 0; // /Height
     }
     if ((pdfIm != 0) && buf3 == 0x42697473 && buf2 == 0x50657243 && buf1 == 0x6f6d706f && buf0 == 0x6e656e74 &&
-        zBuf[(zBufPos - 32 + 15) & 0xFF] == '/') {
+        zBuf[(zBufPos - 32 + 15) & 0xFF] == '/')
+    {
       pdfIm = 4, pdfImB = 0; // /BitsPerComponent
     }
-    if ((pdfIm != 0) && (buf2 & 0xFFFFFF) == 0x2F4465 && buf1 == 0x76696365 && buf0 == 0x47726179) {
+    if ((pdfIm != 0) && (buf2 & 0xFFFFFF) == 0x2F4465 && buf1 == 0x76696365 && buf0 == 0x47726179)
+    {
       pdfGray = 1; // /DeviceGray
     }
 
     // CD sectors detection (mode 1 and mode 2 form 1+2 - 2352 bytes)
-    if (buf1 == 0x00ffffff && buf0 == 0xffffffff && (cdi == 0)) {
+    if (buf1 == 0x00ffffff && buf0 == 0xffffffff && (cdi == 0))
+    {
       cdi = i, cda = -1, cdm = 0;
     }
-    if ((cdi != 0) && i > cdi) {
+    if ((cdi != 0) && i > cdi)
+    {
       const int p = (i - cdi) % 2352;
-      if (p == 8 && (buf1 != 0xffffff00 || ((buf0 & 0xff) != 1 && (buf0 & 0xff) != 2))) {
+      if (p == 8 && (buf1 != 0xffffff00 || ((buf0 & 0xff) != 1 && (buf0 & 0xff) != 2)))
+      {
         cdi = 0;
       }
-      else if (p == 16 && i + 2336 < n) {
+      else if (p == 16 && i + 2336 < n)
+      {
         uint8_t data[2352];
         const uint64_t savedPos = in->curPos();
         in->setpos(start + i - 23);
@@ -809,14 +1311,17 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         if (t != cdm) {
           cdm = t * static_cast<int>(i - cdi < 2352);
         }
-        if ((cdm != 0) && cda != 10 && (cdm == 1 || buf0 == buf1)) {
-          if (detectionInfo.Type != BlockType::CD) {
+        if ((cdm != 0) && cda != 10 && (cdm == 1 || buf0 == buf1))
+        {
+          if (detectionInfo.Type != BlockType::CD)
+          {
             detectionInfo.Type = BlockType::CD;
             detectionInfo.DataStart = start + cdi - 7;
             detectionInfo.DataInfo = cdm;
           }
           cda = (data[12] << 16) + (data[13] << 8) + data[14];
-          if (cdm != 1 && i - cdi > 2352 && buf0 != cdf) {
+          if (cdm != 1 && i - cdi > 2352 && buf0 != cdf)
+          {
             cda = 10;
           }
           if (cdm != 1) {
@@ -827,12 +1332,14 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
           cdi = 0;
         }
       }
-      if ((i + 1 == n || cdi == 0) && detectionInfo.Type == BlockType::CD) {
+      if ((i + 1 == n || cdi == 0) && detectionInfo.Type == BlockType::CD)
+      {
         detectionInfo.DataLength = (start + i - p - 7) - detectionInfo.DataStart;
         return detectionInfo;
       }
     }
-    if (detectionInfo.Type == BlockType::CD) {
+    if (detectionInfo.Type == BlockType::CD)
+    {
       continue;
     }
 
@@ -842,19 +1349,25 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     // a byte stuff (FF 00).
 
     if ((soi == 0) && i >= 3 && (buf0 & 0xffffff00) == 0xffd8ff00 && ((buf0 & 0xFE) == 0xC0 || static_cast<uint8_t>(buf0) == 0xC4 ||
-        (static_cast<uint8_t>(buf0) >= 0xDB && static_cast<uint8_t>(buf0) <= 0xFE))) {
+        (static_cast<uint8_t>(buf0) >= 0xDB && static_cast<uint8_t>(buf0) <= 0xFE)))
+    {
       soi = i, app = i + 2, sos = sof = 0;
     }
-    if (soi != 0) {
-      if (app == i && (buf0 >> 24) == 0xff && ((buf0 >> 16) & 0xff) > 0xc1 && ((buf0 >> 16) & 0xff) < 0xff) {
+    if (soi != 0)
+    {
+      if (app == i && (buf0 >> 24) == 0xff && ((buf0 >> 16) & 0xff) > 0xc1 && ((buf0 >> 16) & 0xff) < 0xff)
+      {
         app = i + (buf0 & 0xffff) + 2;
       }
-      if (app < i && (buf1 & 0xff) == 0xff && (buf0 & 0xfe0000ff) == 0xc0000008) {
+      if (app < i && (buf1 & 0xff) == 0xff && (buf0 & 0xfe0000ff) == 0xc0000008)
+      {
         sof = i;
       }
-      if ((sof != 0) && sof > soi && i - sof < 0x1000 && (buf0 & 0xffff) == 0xffda) {
+      if ((sof != 0) && sof > soi && i - sof < 0x1000 && (buf0 & 0xffff) == 0xffda)
+      {
         sos = i;
-        if (firstSoi == 0) {
+        if (firstSoi == 0)
+        {
           firstSoi = soi;
         }
       }
@@ -862,7 +1375,8 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         soi = 0;
       }
     }
-    if (firstSoi != 0 && (sos != 0) && i > sos && (buf0 & 0xff00) == 0xff00 && (buf0 & 0xff) != 0 && (buf0 & 0xf8) != 0xd0) {
+    if (firstSoi != 0 && (sos != 0) && i > sos && (buf0 & 0xff00) == 0xff00 && (buf0 & 0xff) != 0 && (buf0 & 0xf8) != 0xd0)
+    {
       detectionInfo.Type = BlockType::JPEG;
       detectionInfo.DataStart = start + (firstSoi - 3);
       detectionInfo.DataLength = i + 1 - (firstSoi - 3);
@@ -870,49 +1384,62 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     }
 
     // Detect .wav file header
-    if (buf0 == 0x52494646 /*RIFF*/) { 
+    if (buf0 == 0x52494646 /*RIFF*/)
+    {
       wavi = i;
       wavm = wavLen = 0;
     }
-    if (wavi != 0) {
+    if (wavi != 0)
+    {
       uint64_t p = i - wavi;
-      if (p == 4) {
+      if (p == 4)
+      {
         wavSize = bswap(buf0); //fileSize
       }
-      else if (p == 8) {
+      else if (p == 8)
+      {
         wavType = (buf0 == 0x57415645 /*WAVE*/) ? 1 : (buf0 == 0x7366626B /*sfbk*/) ? 2 : 0;
-        if (wavType == 0) {
+        if (wavType == 0)
+        {
           wavi = 0;
         }
       }
-      else if (wavType != 0) {
-        if (wavType == 1) { // type: WAVE
-          if (p == 16 + wavLen && (buf1 != 0x666d7420 /*"fmt "*/ || ((wavm = bswap(buf0) - 16) & 0xFFFFFFFD) != 0)) {
+      else if (wavType != 0)
+      {
+        if (wavType == 1) // type: WAVE
+        {
+          if (p == 16 + wavLen && (buf1 != 0x666d7420 /*"fmt "*/ || ((wavm = bswap(buf0) - 16) & 0xFFFFFFFD) != 0))
+          {
             wavLen = ((bswap(buf0) + 1) & (-2)) + 8, wavi *= static_cast<int>(buf1 == 0x666d7420 /*"fmt "*/ && (wavm & 0xFFFFFFFD) != 0);
           }
-          else if (p == 22 + wavLen) {
+          else if (p == 22 + wavLen)
+          {
             wavch = bswap(buf0) & 0xffff; // number of channels: 1 or 2
           }
-          else if (p == 34 + wavLen) {
+          else if (p == 34 + wavLen)
+          {
             wavbps = bswap(buf0) & 0xffff; // bits per sample: 8 or 16
           }
-          else if (p == 40 + wavLen + wavm && buf1 != 0x64617461 /*"data"*/) {
+          else if (p == 40 + wavLen + wavm && buf1 != 0x64617461 /*"data"*/)
+          {
             wavm += ((bswap(buf0) + 1) & (-2)) + 8, wavi = (wavm > 0xfffff ? 0 : wavi);
           }
-          else if (p == 40 + wavLen + wavm) {  // The "data" subchunk contains the actual audio data
+          else if (p == 40 + wavLen + wavm)  // The "data" subchunk contains the actual audio data
+          {
             int wavD = bswap(buf0); // size of data section
             wavLen = 0;
             if ((wavch == 1 || wavch == 2) && (wavbps == 8 || wavbps == 16) && wavD > 0 && wavSize >= wavD + 36 &&
-                wavD % ((wavbps / 8) * wavch) == 0) {
+                wavD % ((wavbps / 8) * wavch) == 0)
+            {
               detectionInfo.AUD_DET(start, (wavbps == 8) ? BlockType::AUDIO : BlockType::AUDIO_LE, wavi - 3, 44 + wavm, wavD, wavch + wavbps / 4 - 3);
               if (detectionInfo.SizeVerificationPassed(start + n))
                 return detectionInfo;
             }
             wavi = 0;
           }
-        }
-        else { // format: SF2
-          if ((p == 16 && buf1 != 0x4C495354 /*LIST*/) || (p == 20 && buf0 != 0x494E464F /*INFO*/)) {
+        } else { // format: SF2
+          if ((p == 16 && buf1 != 0x4C495354 /*LIST*/) || (p == 20 && buf0 != 0x494E464F /*INFO*/))
+          {
             wavi = 0;
           }
           else if (p > 20 && buf1 == 0x4C495354 /*LIST*/) {
@@ -944,12 +1471,14 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     }
 
     // Detect .aiff file header
-    if (buf0 == 0x464f524d /*FORM*/) {
+    if (buf0 == 0x464f524d /*FORM*/)
+    {
       aiff = i, aiffs = 0;
     }
     if (aiff != 0) {
       const uint64_t p = i - aiff;
-      if (p == 12 && (buf1 != 0x41494646 /*AIFF*/ || buf0 != 0x434f4d4d /*COMM*/)) {
+      if (p == 12 && (buf1 != 0x41494646 /*AIFF*/ || buf0 != 0x434f4d4d /*COMM*/))
+      {
         aiff = 0; // fail
       }
       else if (p == 24) {
@@ -1007,7 +1536,7 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
 
     // Detect .s3m file header
     if (buf0 == 0x1a100000 && i >= 31) { //0x1A: signature byte, 0x10: song type, 0x0000: reserved
-      s3mi = i, s3Mno = s3Mni = 0; 
+      s3mi = i, s3Mno = s3Mni = 0;
     }
     if (s3mi != 0) {
       const uint64_t p = i - s3mi;
@@ -1061,7 +1590,7 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     //detect uncompressed and rle encoded mrb files inside windows hlp files 506C
     //we support only single images
     if (!mrb && ((buf0 & 0xFFFF) == 0x6c70 || (buf0 & 0xFFFF) == 0x6C50) && !b64S && !cdi) { //Magic: 0x506C (SHG,lP) or 0x706C (MRB,lp)
-      mrb = i; 
+      mrb = i;
       mrbmulti = 0;
     }
     if (mrb != 0) {
@@ -1877,7 +2406,7 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
       e8e9count = 0;
     }
 
-    //DEC Alpha code section detection 
+    //DEC Alpha code section detection
     //Based on the Tru64 Object file format
     //see: https://www3.physnet.uni-hamburg.de/physnet/Tru64-Unix/HTML/APS31DTE/DOCU_013.HTM
     //note: this document^ doesn't cover the same version as in silesia/mozilla
@@ -1921,41 +2450,49 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         decAlpha = 2;
         decAlphaNextExpectedOffset = i + 32;
       }
-      else if (decAlpha == 2 && i == decAlphaNextExpectedOffset) {
+      else if (decAlpha == 2 && i == decAlphaNextExpectedOffset)
+      {
         decAlphaSectionStart = ((uint64_t)bswap(buf0)) << 32 | bswap(buf1);
         decAlphaSectionLen = ((uint64_t)bswap(buf2)) << 32 | bswap(buf3);
         decAlpha = 3;
       }
-      else if (decAlpha == 3 && buf1 == 0x2E696E69 && buf0 == 0x74000000) { // ".init   "
+      else if (decAlpha == 3 && buf1 == 0x2E696E69 && buf0 == 0x74000000) // ".init   "
+      {
         decAlpha = 4;
         decAlphaNextExpectedOffset = i + 32;
       }
-      else if (decAlpha == 4 && i == decAlphaNextExpectedOffset) {
+      else if (decAlpha == 4 && i == decAlphaNextExpectedOffset)
+      {
         uint64_t initstart = ((uint64_t)bswap(buf0)) << 32 | bswap(buf1);
-        if (initstart == decAlphaSectionStart + decAlphaSectionLen) {
+        if (initstart == decAlphaSectionStart + decAlphaSectionLen)
+        {
           decAlphaSectionLen += ((uint64_t)bswap(buf2)) << 32 | bswap(buf3);
           decAlpha = 5;
-        } 
-        else {
+        }
+        else
+        {
           //printf("DECALPHA - found .text and .init sections are not adjacent");
           decAlpha = 0; //fail
         }
       }
-      else if (decAlpha == 5 && buf1 == 0x2E66696E && buf0 == 0x69000000) { // ".fini   "
+      else if (decAlpha == 5 && buf1 == 0x2E66696E && buf0 == 0x69000000) // ".fini   "
+      {
         decAlpha = 6;
         decAlphaNextExpectedOffset = i + 32;
       }
-      else if (decAlpha == 6 && i == decAlphaNextExpectedOffset) {
+      else if (decAlpha == 6 && i == decAlphaNextExpectedOffset)
+      {
         uint64_t finistart = ((uint64_t)bswap(buf0)) << 32 | bswap(buf1);
-        if (finistart == decAlphaSectionStart + decAlphaSectionLen) {
+        if (finistart == decAlphaSectionStart + decAlphaSectionLen)
+        {
           decAlphaSectionLen += ((uint64_t)bswap(buf2)) << 32 | bswap(buf3);
-          if (decAlphaHeaderStart + decAlphaSectionStart + decAlphaSectionLen <= n) {
+          if (decAlphaHeaderStart + decAlphaSectionStart + decAlphaSectionLen <= n)
+          {
             detectionInfo.Type = BlockType::DEC_ALPHA;
             detectionInfo.DataStart = start + decAlphaHeaderStart + decAlphaSectionStart;
             detectionInfo.DataLength = decAlphaSectionLen;
             return detectionInfo;
-          }
-          else {
+          } else {
             //printf("DECALPHA - end of section is past end of file");
             decAlpha = 0; //fail
           }
@@ -1968,7 +2505,7 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     }
 
     // this is the old DEC Alpha detection logic
-    // unused - kept for reference only 
+    // unused - kept for reference only
 #ifdef USE_OLD_DECALPHA_DETECTION
 
     struct {
@@ -2030,7 +2567,7 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
         DEC.branches[DEC.idx] = 0;
       }
 
-      else if (detectionInfo.Type == BlockType::DEC_ALPHA 
+      else if (detectionInfo.Type == BlockType::DEC_ALPHA
         && (start + DEC.offset[DEC.idx]-detectionInfo.DataStart) % 4 == 0
         && ((i + 4 >= n) || (i > DEC.last[DEC.idx] + UINT64_C(0x1000) && DEC.count[DEC.idx] == 0))) {
         detectionInfo.DataStart = start + DEC.offset[DEC.idx];
@@ -2042,62 +2579,87 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
 #endif //USE_OLD_DECALPHA_DETECTION
 
     // Detect base64 encoded data
-    if( b64S == 0 && buf0 == 0x73653634 && ((buf1 & 0xffffff) == 0x206261 || (buf1 & 0xffffff) == 0x204261)) {
+    if( b64S == 0 && buf0 == 0x73653634 && ((buf1 & 0xffffff) == 0x206261 || (buf1 & 0xffffff) == 0x204261))
+    {
       b64S = 1; b64I = i - 6; //' base64' ' Base64'
     }
-    if( b64S == 0 && ((buf1 == 0x3b626173 && buf0 == 0x6536342c) || (buf1 == 0x215b4344 && buf0 == 0x4154415b))) {
+    if( b64S == 0 && ((buf1 == 0x3b626173 && buf0 == 0x6536342c) || (buf1 == 0x215b4344 && buf0 == 0x4154415b)))
+    {
       b64S = 3; b64I = i + 1; // ';base64,' '![CDATA['
     }
-    if( b64S > 0 ) {
-      if( b64S == 1 && buf0 == 0x0d0a0d0a ) {
+    if( b64S > 0 )
+    {
+      if( b64S == 1 && buf0 == 0x0d0a0d0a )
+      {
         b64I = i + 1; b64Line = 0; b64S = 2;
-      } else if( b64S == 2 && (buf0 & 0xffff) == 0x0d0a && b64Line == 0 ) {
+      }
+      else if( b64S == 2 && (buf0 & 0xffff) == 0x0d0a && b64Line == 0 )
+      {
         b64Line = i + 1 - b64I; b64Nl = i;
-      } else if( b64S == 2 && (buf0 & 0xffff) == 0x0d0a && b64Line > 0 && (buf0 & 0xffffff) != 0x3d0d0a ) {
-        if( i - b64Nl < b64Line && buf0 != 0x0d0a0d0a ) {
+      }
+      else if( b64S == 2 && (buf0 & 0xffff) == 0x0d0a && b64Line > 0 && (buf0 & 0xffffff) != 0x3d0d0a )
+      {
+        if( i - b64Nl < b64Line && buf0 != 0x0d0a0d0a )
+        {
           b64End = i - 1; b64S = 5;
-        } else if( buf0 == 0x0d0a0d0a ) {
+        }
+        else if( buf0 == 0x0d0a0d0a )
+        {
           b64End = i - 3 /*remove the last 0d0a*/; b64S = 5;
-        } else if( i - b64Nl == b64Line ) {
+        }
+        else if( i - b64Nl == b64Line )
+        {
           b64Nl = i;
         } else {
           b64S = 0;
         }
-      } else if( b64S == 2 && (buf0 & 0xffffff) == 0x3d0d0a ) {
+      }
+      else if( b64S == 2 && (buf0 & 0xffffff) == 0x3d0d0a )
+      {
         b64End = i - 1; b64S = 5; // '=' or '=='
-      } else if( b64S == 2 && !(isalnum(c) || c == '+' || c == '/' || c == 10 || c == 13 || c == '=')) {
+      }
+      else if( b64S == 2 && !(isalnum(c) || c == '+' || c == '/' || c == 10 || c == 13 || c == '='))
+      {
         b64S = 0;
       }
-      if( b64Line > 0 && (b64Line <= 4 || b64Line > 255)) {
+      if( b64Line > 0 && (b64Line <= 4 || b64Line > 255))
+      {
         b64S = 0;
       }
-      if (b64S == 3 && i >= b64I && !(isalnum(c) || c == '+' || c == '/' || c == '=')) {
+      if (b64S == 3 && i >= b64I && !(isalnum(c) || c == '+' || c == '/' || c == '='))
+      {
         b64End = i;
         b64S = 4;
       }
-      if((b64S == 4 && b64End - b64I > 32) || (b64S == 5 && b64End - b64I > 32 && b64End - b64I < (1 << 27))) {
+      if((b64S == 4 && b64End - b64I > 32) || (b64S == 5 && b64End - b64I > 32 && b64End - b64I < (1 << 27)))
+      {
         detectionInfo.Type = BlockType::BASE64;
         detectionInfo.DataStart = start + b64I;
         detectionInfo.DataLength = b64End - b64I;
         return detectionInfo;
       }
-      if( b64S > 3 ) {
+      if( b64S > 3 )
+      {
         b64S = 0;
       }
-      if( b64S == 1 && i - b64I >= 128 ) {
+      if( b64S == 1 && i - b64I >= 128 )
+      {
         b64S = 0; // detect false positives after 128 bytes
       }
     }
 
     //detect base85 (ascii85) encoded data
     //headers: stream\n stream\r\n oNimage\n utimage\n \nimage\n
-    if (b85state == 0 && ((buf0 == 0x65616D0A && (buf1 & 0xffffff) == 0x737472) || (buf0 == 0x616D0D0A && buf1 == 0x73747265) || (buf0 == 0x6167650A && buf1 == 0x6F4E696D) || (buf0 == 0x6167650A && buf1 == 0x7574696D) || (buf0 == 0x6167650A && (buf1 & 0xffffff) == 0x0A696D))) {
+    if (b85state == 0 && ((buf0 == 0x65616D0A && (buf1 & 0xffffff) == 0x737472) || (buf0 == 0x616D0D0A && buf1 == 0x73747265) || (buf0 == 0x6167650A && buf1 == 0x6F4E696D) || (buf0 == 0x6167650A && buf1 == 0x7574696D) || (buf0 == 0x6167650A && (buf1 & 0xffffff) == 0x0A696D)))
+    {
         b85state = 1;
         base85start = i;
         b85linelength = 0;
     }
-    else if (b85state == 1) {
-      if (c == CARRIAGE_RETURN && b85linelength == 0) {
+    else if (b85state == 1)
+    {
+      if (c == CARRIAGE_RETURN && b85linelength == 0)
+      {
         b85linelength = i - base85start; //capture line lenght
         if (b85linelength <= 25 || b85linelength > 255)
           b85state = 0; //fail
@@ -2105,32 +2667,36 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
       else if (c == '~') { //end marker
         base85end = i - 1;
         b85state = 0;
-        if (((base85end - base85start) > 60) && ((base85end - base85start) < 0x8000000)) {
+        if (((base85end - base85start) > 60) && ((base85end - base85start) < 0x8000000))
+        {
           detectionInfo.Type = BlockType::BASE85;
           detectionInfo.DataStart = start + base85start + 1;
           detectionInfo.DataLength = base85end - base85start;
           return detectionInfo;
         }
       }
-      else if (is_base85(c)) {
+      else if (is_base85(c))
+      {
         // still ok
       }
-      else if (c == CARRIAGE_RETURN && b85linelength != 0) {
+      else if (c == CARRIAGE_RETURN && b85linelength != 0)
+      {
         if (b85linelength != i - base85start)
           b85state = 0; //fail
-      }
-      else {
+      } else {
         b85state = 0; //fail
       }
     }
 
     // UStar (Unix Standard TAR) detection
     // Notable uses: silesia/mozilla, silesia/samba, silesia/xml
-    if (buf1 == 0x75737461 /* "usta" */ && (buf0 == 0x72202000 /* "r  \0" */ || buf0 == 0x72003030 /* "r\000" */)) {
+    if (buf1 == 0x75737461 /* "usta" */ && (buf0 == 0x72202000 /* "r  \0" */ || buf0 == 0x72003030 /* "r\000" */))
+    {
       uint64_t posBackup = in->curPos();
       TarFilter tarFilter;
       bool success = tarFilter.detect(in, start + blockSize);
-      if (success) {
+      if (success)
+      {
         detectionInfo.Type = BlockType::TAR;
         detectionInfo.DataStart = tarFilter.detectedStartPos;
         detectionInfo.DataLength = tarFilter.detectedEndPos - tarFilter.detectedStartPos;
@@ -2140,18 +2706,19 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
     }
 
   }
-  
+
   if (detectionInfo.Type != BlockType::DEFAULT)
     quit("detect(): detection didn't finish properly.");
 
   //special detections (using hash signature)
   //we could detect these *types* of content properly, but since
-  //they are rare, it's just much simpler to detect only those files 
+  //they are rare, it's just much simpler to detect only those files
   //we are targeting
 
   //printf("BlockHash: %" PRIu64 "\n", blockHash);
 
-  if (blockHash == UINT64_C(16175250862432333790) && blockSize == 513216) { //calgary/pic; canterbury/ptt5
+  if (blockHash == UINT64_C(16175250862432333790) && blockSize == 513216) //calgary/pic; canterbury/ptt5
+  {
     detectionInfo.IMG_DET(start, BlockType::IMAGE1, 0, 0, 1728 / 8, 2376);
     return detectionInfo;
   }
@@ -2164,19 +2731,603 @@ static DetectionInfo detect(File *in, uint64_t blockSize, const TransformOptions
   return detectionInfo;
 }
 
-#include "bmp.hpp"
-#include "endianness16b.hpp"
-#include "eol.hpp"
-#include "exe.hpp"
-#include "rle.hpp"
+
+/**
+ * 24/32-bit image data transforms, controlled by OPTION_SKIPRGB:
+ *   - simple color transform (b, g, r) -> (g, g-r, g-b)
+ *   - channel reorder only (b, g, r) -> (g, r, b)
+ * Detects RGB565 to RGB888 conversions.
+ */
+class BmpFilter : public Filter {
+private:
+  int stride = 3; //3: RGB or BGR, 4: RGBA or BGRA
+  int width = 0;
+  bool skipRgb = false;
+  bool isPossibleRgb565 = true;
+  uint32_t rgb565Run = 0;
+  static constexpr int rgb565MinRun = 63;
+public:
+
+  void setWidth(int w) {
+    this->width = w;
+  }
+  void setSkipRgb(bool skipRgb) {
+    this->skipRgb = skipRgb;
+  }
+  void setHasApha() {
+    this->stride = 4;
+    this->isPossibleRgb565 = false; //to fix false positives (and to keep compatibility with previous version)
+  }
+
+  void encode(File *in, File *out, uint64_t size, int width, int & /*headerSize*/) override {
+    uint32_t r = 0;
+    uint32_t g = 0; // green is always the middle channel in both RGB and BGR images, the transform is symmetric in r and b
+    uint32_t b = 0;
+    for( int i = 0; i < static_cast<int>(size / width); i++ ) {
+      for( int j = 0; j < width / stride; j++ ) {
+        b = in->getchar();
+        g = in->getchar();
+        r = in->getchar();
+        if( isPossibleRgb565 ) {
+          int rgb565RunPrevious = rgb565Run;
+          rgb565Run = min(rgb565Run + 1, 0xFFFF) *
+                  static_cast<int>((b & 7) == ((b & 8) - ((b >> 3) & 1)) && (g & 3) == ((g & 4) - ((g >> 2) & 1)) &&
+                                    (r & 7) == ((r & 8) - ((r >> 3) & 1)));
+          if( rgb565Run > rgb565MinRun || rgb565RunPrevious >= rgb565MinRun ) {
+            b ^= (b & 8) - ((b >> 3) & 1);
+            g ^= (g & 4) - ((g >> 2) & 1);
+            r ^= (r & 8) - ((r >> 3) & 1);
+          }
+          isPossibleRgb565 = rgb565Run > 0;
+        }
+        if (!skipRgb) {
+          r = g - r;
+          b = g - b;
+        }
+        out->putChar(g);
+        out->putChar(r);
+        out->putChar(b);
+        if (stride == 4) {
+          out->putChar(in->getchar());
+        }
+      }
+      for( int j = 0; j < width % stride; j++ ) {
+        out->putChar(in->getchar());
+      }
+    }
+    for( int i = size % width; i > 0; i-- ) {
+      out->putChar(in->getchar());
+    }
+  }
+
+  uint64_t decode(File * /*in*/, File *out, FMode fMode, uint64_t size, uint64_t &diffFound) override {
+    uint32_t r = 0;
+    uint32_t g = 0;
+    uint32_t b = 0;
+    uint32_t a = 0;
+    uint32_t p = 0;
+    for( int i = 0; i < static_cast<int>(size / width); i++ ) {
+      p = i * width;
+      for( int j = 0; j < width / stride; j++ ) {
+        g = encoder->decompressByte(encoder->predictorMain);
+        r = encoder->decompressByte(encoder->predictorMain);
+        b = encoder->decompressByte(encoder->predictorMain);
+        if (stride == 4) {
+          a = encoder->decompressByte(encoder->predictorMain);
+        }
+        if( !skipRgb )
+        {
+          r = g - r;
+          b = g - b;
+        }
+        if( isPossibleRgb565 )
+        {
+          if( rgb565Run >= rgb565MinRun )
+          {
+            b ^= (b & 8) - ((b >> 3) & 1);
+            g ^= (g & 4) - ((g >> 2) & 1);
+            r ^= (r & 8) - ((r >> 3) & 1);
+          }
+          rgb565Run = min(rgb565Run + 1, 0xFFFF) *
+                  static_cast<uint32_t>((b & 7) == ((b & 8) - ((b >> 3) & 1)) && (g & 3) == ((g & 4) - ((g >> 2) & 1)) &&
+                                        (r & 7) == ((r & 8) - ((r >> 3) & 1)));
+          isPossibleRgb565 = rgb565Run > 0;
+        }
+        if( fMode == FMode::FDECOMPRESS )
+        {
+          out->putChar(b);
+          out->putChar(g);
+          out->putChar(r);
+          if (stride == 4)
+          {
+            out->putChar(a);
+          }
+          if((j == 0) && ((i & 0xF) == 0))
+          {
+            encoder->printStatus();
+          }
+        }
+        else if( fMode == FMode::FCOMPARE )
+        {
+          if((b & 255) != out->getchar() && (diffFound == 0))
+          {
+            diffFound = p + 1;
+          }
+          if( g != out->getchar() && (diffFound == 0))
+          {
+            diffFound = p + 2;
+          }
+          if((r & 255) != out->getchar() && (diffFound == 0))
+          {
+            diffFound = p + 3;
+          }
+          if (stride == 4)
+          {
+            if ((a & 255) != out->getchar() && (diffFound == 0))
+            {
+              diffFound = p + 4;
+            }
+          }
+          p += stride;
+        }
+      }
+      for( int j = 0; j < width % stride; j++ )
+      {
+        if( fMode == FMode::FDECOMPRESS )
+        {
+          out->putChar(encoder->decompressByte(encoder->predictorMain));
+        }
+        else if( fMode == FMode::FCOMPARE )
+        {
+          if( encoder->decompressByte(encoder->predictorMain) != out->getchar() && (diffFound == 0))
+          {
+            diffFound = p + j + 1;
+          }
+        }
+      }
+    }
+    for( int i = size % width; i > 0; i-- )
+    {
+      if( fMode == FMode::FDECOMPRESS )
+      {
+        out->putChar(encoder->decompressByte(encoder->predictorMain));
+      } else if( fMode == FMode::FCOMPARE )
+      {
+        if( encoder->decompressByte(encoder->predictorMain) != out->getchar() && (diffFound == 0))
+        {
+          diffFound = size - i;
+          break;
+        }
+      }
+    }
+    return size;
+  }
+};
+
+
+
+class EndiannessFilter : public Filter {
+public:
+  void encode(File *in, File *out, uint64_t size, int  /*info*/, int & /*headerSize*/) override {
+    for( uint64_t i = 0, l = size >> 1; i < l; i++ ) {
+      uint8_t b = in->getchar();
+      out->putChar(in->getchar());
+      out->putChar(b);
+    }
+    if((size & 1) > 0 ) {
+      out->putChar(in->getchar());
+    }
+  }
+
+  uint64_t decode(File * /*in*/, File *out, FMode fMode, uint64_t size, uint64_t &diffFound) override {
+    for( uint64_t i = 0, l = size >> 1; i < l; i++ ) {
+      uint8_t b1 = encoder->decompressByte(encoder->predictorMain);
+      uint8_t b2 = encoder->decompressByte(encoder->predictorMain);
+      if( fMode == FMode::FDECOMPRESS ) {
+        out->putChar(b2);
+        out->putChar(b1);
+      } else if( fMode == FMode::FCOMPARE ) {
+        bool ok = out->getchar() == b2;
+        ok &= out->getchar() == b1;
+        if( !ok && (diffFound == 0)) {
+          diffFound = size - i * 2;
+          break;
+        }
+      }
+      if( fMode == FMode::FDECOMPRESS && ((i & 0x7FF) == 0)) {
+        encoder->printStatus();
+      }
+    }
+    if((diffFound == 0) && (size & 1) > 0 ) {
+      if( fMode == FMode::FDECOMPRESS ) {
+        out->putChar(encoder->decompressByte(encoder->predictorMain));
+      } else if( fMode == FMode::FCOMPARE ) {
+        if( out->getchar() != encoder->decompressByte(encoder->predictorMain)) {
+          diffFound = size - 1;
+        }
+      }
+    }
+    return size;
+  }
+
+};
+
+
+
+/**
+ * End of line transform
+ */
+class EolFilter:
+public Filter
+{
+public:
+  void encode(File *in, File *out, uint64_t size, int /*info*/, int & /*headerSize*/) override
+  {
+    uint8_t b = 0;
+    uint8_t pB = 0;
+    for( uint64_t i = 0; i < size; i++ )
+    {
+      b = in->getchar();
+      if( pB == CARRIAGE_RETURN && b != NEW_LINE )
+      {
+        out->putChar(pB);
+      }
+      if( b != CARRIAGE_RETURN )
+      {
+        out->putChar(b);
+      }
+      pB = b;
+    }
+    if( b == CARRIAGE_RETURN )
+    {
+      out->putChar(b);
+    }
+  }
+
+  uint64_t decode(File * /*in*/, File *out, FMode fMode, uint64_t size, uint64_t &diffFound) override
+  {
+    uint8_t b = 0;
+    uint64_t count = 0;
+    for( uint64_t i = 0; i < size; i++, count++ )
+    {
+      if((b = encoder->decompressByte(encoder->predictorMain)) == NEW_LINE )
+      {
+        if( fMode == FMode::FDECOMPRESS )
+        {
+          out->putChar(CARRIAGE_RETURN);
+        }
+        else if( fMode == FMode::FCOMPARE )
+        {
+          if( out->getchar() != CARRIAGE_RETURN && (diffFound == 0))
+          {
+            diffFound = size - i;
+            break;
+          }
+        }
+        count++;
+      }
+      if( fMode == FMode::FDECOMPRESS )
+      {
+        out->putChar(b);
+      }
+      else if( fMode == FMode::FCOMPARE )
+      {
+        if( b != out->getchar() && (diffFound == 0))
+        {
+          diffFound = size - i;
+          break;
+        }
+      }
+      if( fMode == FMode::FDECOMPRESS && ((i & 0xFFF) == 0))
+      {
+        encoder->printStatus();
+      }
+    }
+    return count;
+  }
+};
+
+
+
+/**
+ * EXE transform: <encoded-size> <begin> <block>...
+ * Encoded-size is 4 bytes, MSB first.
+ * begin is the offset of the start of the input file, 4 bytes, MSB first.
+ * Each block applies the e8e9 transform to strings falling entirely
+ * within the block starting from the end and working backwards.
+ * The 5 byte pattern is E8/E9 xx xx xx 00/FF (x86 CALL/JMP xxxxxxxx)
+ * where xxxxxxxx is a relative address LSB first.  The address is
+ * converted to an absolute address by adding the offset mod 2^25
+ * (in range +-2^24).
+ */
+class ExeFilter : public Filter {
+private:
+  constexpr static int block = 0x10000; /**< block size */
+  int info;
+public:
+
+void setBegin(int info) {
+  this->info = info;
+}
+
+/**
+    * @todo Large file support
+    * @param in
+    * @param out
+    * @param size
+    * @param info
+    */
+  void encode(File *in, File *out, uint64_t size, int info, int &/*headerSize*/) override {
+    Array<uint8_t> blk(block);
+
+    // Transform
+    for( uint64_t offset = 0; offset < size; offset += block ) {
+      uint32_t size1 = min(uint32_t(size - offset), block);
+      int bytesRead = static_cast<int>(in->blockRead(&blk[0], size1));
+      if( bytesRead != static_cast<int>(size1)) {
+        quit("encodeExe read error");
+      }
+      for( int i = bytesRead - 1; i >= 5; --i ) {
+        if((blk[i - 4] == 0xe8 || blk[i - 4] == 0xe9 || (blk[i - 5] == 0x0f && (blk[i - 4] & 0xf0) == 0x80)) &&
+            (blk[i] == 0 || blk[i] == 0xff)) {
+          int a = (blk[i - 3] | blk[i - 2] << 8 | blk[i - 1] << 16 | blk[i] << 24) + static_cast<int>(offset + info) + i + 1;
+          a <<= 7;
+          a >>= 7;
+          blk[i] = a >> 24;
+          blk[i - 1] = a ^ 176;
+          blk[i - 2] = (a >> 8) ^ 176;
+          blk[i - 3] = (a >> 16) ^ 176;
+        }
+      }
+      out->blockWrite(&blk[0], bytesRead);
+    }
+  }
+
+  /**
+    * @todo Large file support
+    * @param in
+    * @param out
+    * @param fMode
+    * @param size
+    * @param diffFound
+    * @return
+    */
+  uint64_t decode(File */*in*/, File* out, FMode fMode, uint64_t size, uint64_t& diffFound) override {
+    int offset = 6;
+    int a = 0;
+    uint8_t c[6];
+    uint64_t begin = info;
+    for( int i = 4; i >= 0; i-- ) {
+      c[i] = encoder->decompressByte(encoder->predictorMain); // Fill queue
+    }
+
+    while( offset < static_cast<int>(size) + 6 ) {
+      memmove(c + 1, c, 5);
+      if( offset <= static_cast<int>(size)) {
+        c[0] = encoder->decompressByte(encoder->predictorMain);
+      }
+      // E8E9 transform: E8/E9 xx xx xx 00/FF -> subtract location from x
+      if((c[0] == 0x00 || c[0] == 0xFF) && (c[4] == 0xE8 || c[4] == 0xE9 || (c[5] == 0x0F && (c[4] & 0xF0) == 0x80)) &&
+          (((offset - 1) ^ (offset - 6)) & -block) == 0 && offset <= static_cast<int>(size)) { // not crossing block boundary
+        a = ((c[1] ^ 176) | (c[2] ^ 176) << 8 | (c[3] ^ 176) << 16 | c[0] << 24) - offset - static_cast<int>(begin);
+        a <<= 7;
+        a >>= 7;
+        c[3] = a;
+        c[2] = a >> 8;
+        c[1] = a >> 16;
+        c[0] = a >> 24;
+      }
+      if( fMode == FMode::FDECOMPRESS ) {
+        out->putChar(c[5]);
+      } else if( fMode == FMode::FCOMPARE && c[5] != out->getchar() && (diffFound == 0)) {
+        diffFound = offset - 6 + 1;
+      }
+      if( fMode == FMode::FDECOMPRESS && ((offset & 0x0fff) == 0)) {
+        encoder->printStatus();
+      }
+      offset++;
+    }
+    return size;
+  }
+};
+
+
+class RleFilter:
+Filter
+{
+private:
+
+  int scanLineSize = 0;
+
+  enum class RleState
+  {
+      BASE, LITERAL, RUN, LITERAL_RUN
+  } state = RleState::BASE;
+
+  void rleOutputRun(uint8_t byte, uint8_t* &outPtr, int &run)
+  {
+    while (run > 128)
+    {
+        *outPtr++ = 0xFF, *outPtr++ = byte;
+        run -= 128;
+    }
+      *outPtr++ = (uint8_t)(0x80 | (run - 1)), *outPtr++ = byte;
+  }
+
+
+  void handleRun(uint8_t byte, uint8_t *&outPtr, uint8_t *&lastLiteral, int &run)
+  {
+    if( run > 1 )
+    {
+      state = RleState::RUN;
+      rleOutputRun(byte, outPtr, run);
+    } else {
+      lastLiteral = outPtr;
+      *outPtr++ = 0, *outPtr++ = byte;
+      state = RleState::LITERAL;
+    }
+  }
+
+  void handleLiteral(uint8_t byte, uint8_t *&outPtr, uint8_t *lastLiteral, int &run)
+  {
+    if( run > 1 )
+    {
+      state = RleState::LITERAL_RUN;
+      rleOutputRun(byte, outPtr, run);
+    } else {
+      if( ++(*lastLiteral) == 127 )
+      {
+        state = RleState::BASE;
+      }
+      *outPtr++ = byte;
+    }
+  }
+
+  uint8_t handleLiteralRun(uint8_t *outPtr, uint8_t *lastLiteral)
+  {
+    uint8_t loop = 0;
+    if( outPtr[-2] == 0x81 && *lastLiteral < (125))
+    {
+      state = (((*lastLiteral) += 2) == 127) ? RleState::BASE : RleState::LITERAL;
+      outPtr[-2] = outPtr[-1];
+    } else {
+      state = RleState::RUN;
+    }
+    loop = 1;
+    return loop;
+  }
+
+public:
+
+  void setScanLineSize(int scanLineSize)
+  {
+    this->scanLineSize = scanLineSize; // Run-length Packets should never encode pixels from more than one scan line (important for "decode")
+  }
+
+  static int VLICost(uint64_t n)
+  {
+    int cost = 1;
+    while (n > 0x7F)
+    {
+      n >>= 7;
+      cost++;
+    }
+    return cost;
+  }
+  void encode(File *in, File *out, uint64_t size, int /*info*/, int& headerSize) override
+  {
+    uint8_t b = 0;
+    uint8_t c = in->getchar();
+    int i = 1;
+    out->putVLI(scanLineSize);
+    headerSize = VLICost(scanLineSize);
+
+    while( i < static_cast<int>(size))
+    {
+      b = in->getchar(), i++;
+      if( c == 0x80 )
+      {
+        c = b;
+        continue;
+      }
+      if( c > 0x7F )
+      {
+        for( uint32_t j = 0; j <= (c & 0x7F); j++ )
+        {
+          out->putChar(b);
+        }
+        c = in->getchar(), i++;
+      }
+      else
+      {
+        for(uint32_t j = 0; j <= c; j++, i++ )
+        {
+          out->putChar(b), b = in->getchar();
+        }
+        c = b;
+      }
+    }
+  }
+
+  uint64_t decode(File *in, File *out, FMode fMode, uint64_t  /*size*/, uint64_t &diffFound) override
+  {
+    uint8_t inBuffer[0x10000] = {0};
+    uint8_t outBuffer[0x10200] = {0};
+    uint64_t pos = 0;
+    scanLineSize = static_cast<int>(in->getVLI());
+
+    do
+    {
+      uint64_t remaining = in->blockRead(&inBuffer[0], scanLineSize);
+      uint8_t *inPtr = (uint8_t *) inBuffer;
+      uint8_t *outPtr = (uint8_t *) outBuffer;
+      uint8_t *lastLiteral = nullptr;
+      state = RleState::BASE;
+      while( remaining > 0 )
+      {
+        uint8_t byte = *inPtr++;
+        uint8_t loop = 0;
+        int run = 1;
+        for( remaining--; remaining > 0 && byte == *inPtr; remaining--, run++, inPtr++ )
+        {}
+        do
+        {
+          loop = 0;
+          switch( state )
+          {
+            case RleState::BASE:
+            case RleState::RUN:
+            {
+              handleRun(byte, outPtr, lastLiteral, run);
+              break;
+            }
+            case RleState::LITERAL:
+            {
+              handleLiteral(byte, outPtr, lastLiteral, run);
+              break;
+            }
+            case RleState::LITERAL_RUN:
+            {
+              loop = handleLiteralRun(outPtr, lastLiteral);
+            }
+          }
+        }
+        while( loop != 0 );
+      }
+
+      uint64_t length = outPtr - (&outBuffer[0]);
+      if( fMode == FMode::FDECOMPRESS )
+      {
+        out->blockWrite(&outBuffer[0], length);
+      }
+      else if( fMode == FMode::FCOMPARE )
+      {
+        for(uint32_t j = 0; j < length; ++j )
+        {
+          if( outBuffer[j] != out->getchar() && (diffFound == 0))
+          {
+            diffFound = pos + j + 1;
+            break;
+          }
+        }
+      }
+      pos += length;
+    }
+    while( !in->eof() && (diffFound == 0));
+    return pos;
+  }
+};
+
 
 //////////////////// Compress, Decompress ////////////////////////////
 
-static void directEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &en, int info) {
+static void directEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &en, int info)
+{
   // TODO: Large file support
   Block::EncodeBlockHeader(&en, type, len, info);
   fprintf(stderr, "Compressing... ");
-  for( uint64_t j = 0; j < len; ++j ) {
+  for( uint64_t j = 0; j < len; ++j )
+  {
     if((j & 0xfff) == 0 ) {
       en.printStatus(j, len);
     }
@@ -2189,14 +3340,16 @@ static void compressRecursive(File *in, uint64_t blockSize, Encoder &en, String 
 static void compressRecursiveForTar(File* in, uint64_t blockSize, Encoder& en, String& blstr, float p1, float p2, const TransformOptions* const transformOptions);
 
 static uint64_t decodeFunc(BlockType type, Encoder &en, File *tmp, uint64_t len, int info, File *out, FMode mode, uint64_t &diffFound, const TransformOptions* const transformOptions) {
-  if( type == BlockType::IMAGE24 ) {
+  if( type == BlockType::IMAGE24 )
+  {
     auto f = BmpFilter();
     f.setWidth(info);
     f.setSkipRgb(transformOptions->skipRgb);
     f.setEncoder(en);
     return f.decode(tmp, out, mode, len, diffFound);
   }
-  if( type == BlockType::IMAGE32 ) {
+  if( type == BlockType::IMAGE32 )
+  {
     auto f = BmpFilter();
     f.setWidth(info);
     f.setSkipRgb(transformOptions->skipRgb);
@@ -2204,7 +3357,8 @@ static uint64_t decodeFunc(BlockType type, Encoder &en, File *tmp, uint64_t len,
     f.setEncoder(en);
     return f.decode(tmp, out, mode, len, diffFound);
   }
-  if (type == BlockType::PNG8GRAY || type == BlockType::PNG8 || type == BlockType::PNG24|| type == BlockType::PNG32) {
+  if (type == BlockType::PNG8GRAY || type == BlockType::PNG8 || type == BlockType::PNG24|| type == BlockType::PNG32)
+  {
     auto f = PngFilter();
     f.setWidth(info);
     auto stride = type == BlockType::PNG24 ? 3 : type == BlockType::PNG32 ? 4 : 1;
@@ -2212,13 +3366,14 @@ static uint64_t decodeFunc(BlockType type, Encoder &en, File *tmp, uint64_t len,
     f.setEncoder(en);
     return f.decode(tmp, out, mode, len, diffFound);
   }
-  if( type == BlockType::AUDIO_LE ) {
+  if( type == BlockType::AUDIO_LE )
+  {
     auto f = EndiannessFilter();
     f.setEncoder(en);
     return f.decode(tmp, out, mode, len, diffFound);
   } else if( type == BlockType::EXE ) {
     auto f = ExeFilter();
-    f.setBegin(info); 
+    f.setBegin(info);
     f.setEncoder(en);
     return f.decode(tmp, out, mode, len, diffFound);
   } else if( type == BlockType::TEXT_EOL ) {
@@ -2288,7 +3443,7 @@ static uint64_t encodeFunc(BlockType type, File *in, File *tmp, uint64_t len, in
     f.encode(in, tmp, len, info, hdrsize);
   } else if( type == BlockType::EXE ) {
     auto f = ExeFilter();
-    f.setBegin(info); 
+    f.setBegin(info);
     f.encode(in, tmp, len, info, hdrsize);
   } else if( type == BlockType::TEXT_EOL ) {
     auto f = EolFilter();
@@ -2383,7 +3538,7 @@ transformEncodeBlock(BlockType type, File *in, uint64_t len, Encoder &en, int in
           String blstrSub2;
           blstrSub2 += blstr.c_str();
           blstrSub2 += "-->";
-          const char* exploded = 
+          const char* exploded =
                            "exploded    ";
           const char* addedheader =
             isPNG(type)  ? "filter data " : // PNG ->Image
@@ -2436,7 +3591,7 @@ static void composeSubBlockStringToPrint(String& blstr, String& blstrSub, int bl
 static void printBlock(const uint64_t begin, const uint64_t len, const BlockType type, const int blockInfo, String& blstrSub) {
   static const char* typeNames[30] = { "default", "jpeg", "hdr", "1b-image", "4b-image", "8b-image", "8b-img-grayscale",
                                       "24b-image", "32b-image", "audio", "audio - le", "x86/64", "cd", "zlib", "base64", "gif", "png-8b",
-                                      "png-8b-grayscale", "png-24b", "png-32b", "text", "text - eol", "rle", "lzw", "dec-alpha", "mrb", 
+                                      "png-8b-grayscale", "png-24b", "png-32b", "text", "text - eol", "rle", "lzw", "dec-alpha", "mrb",
                                       "dBase", "base85", "tar", "tar header"};
   static const char* audioTypes[4] = { "8b-mono", "8b-stereo", "16b-mono", "16b-stereo" };
   static const char* mrbTypes[4] = { "mrb-uncompressed", "mrb-rle", "mrb-lz77", "mrb-rle-lz77" };
@@ -2450,10 +3605,10 @@ static void printBlock(const uint64_t begin, const uint64_t len, const BlockType
     printf(" (%s)", audioTypes[blockInfo % 4]);
   }
   else if (
-    type == BlockType::IMAGE1 || 
-    type == BlockType::IMAGE4 || 
+    type == BlockType::IMAGE1 ||
+    type == BlockType::IMAGE4 ||
     type == BlockType::IMAGE8 ||
-    type == BlockType::IMAGE8GRAY || 
+    type == BlockType::IMAGE8GRAY ||
     type == BlockType::IMAGE24 ||
     type == BlockType::IMAGE32 ||
     (type == BlockType::ZLIB && isPNG(BlockType(blockInfo >> 24)))) {
@@ -2500,7 +3655,7 @@ static void compressRecursive(File *in, uint64_t bytesToProcess, Encoder &en, St
   int blNum = 0;
   while(bytesToProcess > 0 ) {
 
-    //detect a block 
+    //detect a block
     DetectionInfo detectionInfo = detect(in, bytesToProcess, transformOptions); // Special blocktypes
     in->setpos(begin);
 
@@ -2521,7 +3676,7 @@ static void compressRecursive(File *in, uint64_t bytesToProcess, Encoder &en, St
 
     if (begin != detectionInfo.DataStart)
       quit("Internal error in compressRecursive");
-    
+
     if (detectionInfo.DataLength != 0) {
       compressBlock(in, detectionInfo.DataStart, detectionInfo.DataLength, /*ref: */ blNum, detectionInfo.Type, detectionInfo.DataInfo, en, /*in: */ blstr, /*ref: */ p1, /*ref: */ p2, pscale, transformOptions);
       begin += detectionInfo.DataLength;
@@ -2587,8 +3742,10 @@ static void compressfile(const Shared* const shared, const char *filename, uint6
   }
   in.close();
 
-  if (shared->GetOptionMultipleFileMode()) { //multiple file mode
-    if( verbose ) {
+  if (shared->GetOptionMultipleFileMode()) //multiple file mode
+  {
+    if( verbose )
+    {
       printf("File size to encode   : 4\n"); //This string must be long enough. "Compressing ..." is still on screen, we need to overwrite it.
     }
     printf("File input size       : %" PRIu64 "\n", fileSize);
@@ -2596,44 +3753,60 @@ static void compressfile(const Shared* const shared, const char *filename, uint6
   }
 }
 
-static uint64_t decompressRecursive(File *out, uint64_t blockSize, Encoder &en, FMode mode, TransformOptions *transformOptions) {
+static uint64_t decompressRecursive(File *out, uint64_t blockSize, Encoder &en, FMode mode, TransformOptions *transformOptions)
+{
   uint64_t i = 0;
   uint64_t diffFound = 0;
-  while( i < blockSize ) {
+  while( i < blockSize )
+  {
 
     uint64_t len = Block::DecodeBlockHeader(&en);
     BlockType type = en.predictorMain->shared->State.blockType;
     int info = en.predictorMain->shared->State.blockInfo;
-    if (type == BlockType::MRB) {
+    if (type == BlockType::MRB)
+    {
       FileTmp tmp;
       for (uint64_t j = 0; j < len; ++j)
           tmp.putChar(en.decompressByte(en.predictorMain));
-      if (mode != FMode::FDISCARD) {
+      if (mode != FMode::FDISCARD)
+      {
         tmp.setpos(0);
         len = decodeFunc(type, en, &tmp, len, info, out, mode, diffFound, transformOptions);
       }
       tmp.close();
-    } else if( hasRecursion(type)) {
+    }
+    else if( hasRecursion(type))
+    {
       FileTmp tmp;
       decompressRecursive(&tmp, len, en, FMode::FDECOMPRESS, transformOptions);
-      if( mode != FMode::FDISCARD ) {
+      if( mode != FMode::FDISCARD )
+      {
         tmp.setpos(0);
-        if( hasTransform(type, info)) {
+        if( hasTransform(type, info))
+        {
           len = decodeFunc(type, en, &tmp, len, info, out, mode, diffFound, transformOptions);
         }
       }
       tmp.close();
-    } else if( hasTransform(type, info)) {
+    }
+    else if( hasTransform(type, info))
+    {
       len = decodeFunc(type, en, nullptr, len, info, out, mode, diffFound, transformOptions);
     } else {
-      for( uint64_t j = 0; j < len; ++j ) {
-        if((j & 0xfff) == 0 ) {
+      for( uint64_t j = 0; j < len; ++j )
+      {
+        if((j & 0xfff) == 0 )
+        {
           en.printStatus();
         }
-        if( mode == FMode::FDECOMPRESS ) {
+        if( mode == FMode::FDECOMPRESS )
+        {
           out->putChar(en.decompressByte(en.predictorMain));
-        } else if( mode == FMode::FCOMPARE ) {
-          if( en.decompressByte(en.predictorMain) != out->getchar() && (diffFound == 0)) {
+        }
+        else if( mode == FMode::FCOMPARE )
+        {
+          if( en.decompressByte(en.predictorMain) != out->getchar() && (diffFound == 0))
+          {
             mode = FMode::FDISCARD;
             diffFound = i + j + 1;
           }
@@ -2648,14 +3821,16 @@ static uint64_t decompressRecursive(File *out, uint64_t blockSize, Encoder &en, 
 }
 
 // Decompress or compare a file
-static void decompressFile(const Shared* const shared, const char* filename, FMode fMode, Encoder& en) {
+static void decompressFile(const Shared* const shared, const char* filename, FMode fMode, Encoder& en)
+{
   assert(en.getMode() == DECOMPRESS);
   assert(filename && filename[0]);
 
   uint64_t fileSize = Block::DecodeBlockSize(&en);
 
   FileDisk f;
-  if( fMode == FMode::FCOMPARE ) {
+  if( fMode == FMode::FCOMPARE )
+  {
     f.open(filename, true);
     printf("Comparing");
   } else { //mode==FDECOMPRESS;
@@ -2667,11 +3842,16 @@ static void decompressFile(const Shared* const shared, const char* filename, FMo
   // Decompress/Compare
   TransformOptions transformOptions(shared);
   uint64_t r = decompressRecursive(&f, fileSize, en, fMode, &transformOptions);
-  if( fMode == FMode::FCOMPARE && (r == 0) && f.getchar() != EOF) {
+  if( fMode == FMode::FCOMPARE && (r == 0) && f.getchar() != EOF)
+  {
     printf("file is longer\n");
-  } else if( fMode == FMode::FCOMPARE && (r != 0)) {
+  }
+  else if( fMode == FMode::FCOMPARE && (r != 0))
+  {
     printf("differ at %" PRIu64 "\n", r - 1);
-  } else if( fMode == FMode::FCOMPARE ) {
+  }
+  else if( fMode == FMode::FCOMPARE )
+  {
     printf("identical\n");
   } else {
     printf("done   \n");

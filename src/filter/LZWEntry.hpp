@@ -1,6 +1,7 @@
 #pragma once
 
-struct LZWentry {
+struct LZWentry
+{
   short prefix;
   short suffix;
 };

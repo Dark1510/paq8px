@@ -2,7 +2,8 @@
 
 #include <cstdint>
 
-class DECAlpha {
+class DECAlpha
+{
 public:
   enum InstructionFormat { Bra, F_P, Mem, Mfc, Mbr, Opr, Pcd, Nop };
   static uint32_t const op10[];

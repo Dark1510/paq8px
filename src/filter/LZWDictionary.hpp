@@ -4,7 +4,8 @@
 #include "LZWEntry.hpp"
 #include <cstdint>
 
-class LZWDictionary {
+class LZWDictionary
+{
 private:
   static constexpr int hashSize = 9221;
   LZWentry dictionary[4096] {};

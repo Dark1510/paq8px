@@ -3,8 +3,9 @@
 #include "../Array.hpp"
 #include <cstdint>
 
-struct TextParserStateInfo {
-public:
+struct TextParserStateInfo
+{
+//public: // structs are public by default if i remember correctly.
   uint64_t Start{0};
   uint64_t End{UINT64_MAX}; /**< position of last char with a valid UTF8 state: marks the end of the detected TEXT block */
   uint32_t invalidCount{}; /**< adaptive count of invalid UTF8 sequences seen recently */
